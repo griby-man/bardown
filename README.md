@@ -31,7 +31,7 @@ a friend ([Codeburglar55](https://codeberg.org/Codeburglar55) on Codeberg,
 | Mode | Tested | Played |
 |---|---|---|
 | Play Now | a full game, opening faceoff to the post-game screen | yes |
-| Season | new season, saving, loading, simulating a month, save and exit | yes |
+| Season | new season, saving, loading, simulating a month, save and exit | |
 | Tutorials | | yes |
 | Be a GM | a new career, the salary cap, simulating preseason | |
 | Live the Life (Be a Pro) | picking a player, the career hub, shifts with the pro camera, instant replay | |
