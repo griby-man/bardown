@@ -1,0 +1,733 @@
+diff --git a/XenosRecomp/main.cpp b/XenosRecomp/main.cpp
+index d015145..dd90616 100644
+--- a/XenosRecomp/main.cpp
++++ b/XenosRecomp/main.cpp
+@@ -4,10 +4,12 @@
+ 
+ static std::unique_ptr<uint8_t[]> readAllBytes(const char* filePath, size_t& fileSize)
+ {
++    // the size from the file system: ftell is a 32-bit long on Windows, and the disc has a 2.8 GB archive
++    std::error_code ec;
++    fileSize = size_t(std::filesystem::file_size(filePath, ec));
++    if (ec)
++        fileSize = 0;
+     FILE* file = fopen(filePath, "rb");
+-    fseek(file, 0, SEEK_END);
+-    fileSize = ftell(file);
+-    fseek(file, 0, SEEK_SET);
+     auto data = std::make_unique<uint8_t[]>(fileSize);
+     fread(data.get(), 1, fileSize, file);
+     fclose(file);
+@@ -27,6 +29,7 @@ struct RecompiledShader
+     IDxcBlob* dxil = nullptr;
+     std::vector<uint8_t> spirv;
+     uint32_t specConstantsMask = 0;
++    uint32_t flags = 0;
+ };
+ 
+ int main(int argc, char** argv)
+@@ -113,7 +116,10 @@ int main(int argc, char** argv)
+                 files.emplace_back(std::move(fileData));
+         }
+ 
++        const std::string_view outputView(output);
++        const bool binaryOut = outputView.size() > 4 && outputView.substr(outputView.size() - 4) == ".bin";
+         std::atomic<uint32_t> progress = 0;
++        std::atomic<uint32_t> failures = 0;
+ 
+         std::for_each(std::execution::par_unseq, shaders.begin(), shaders.end(), [&](auto& hashShaderPair)
+             {
+@@ -124,6 +130,7 @@ int main(int argc, char** argv)
+                 recompiler.recompile(shader.data, include);
+ 
+                 shader.specConstantsMask = recompiler.specConstantsMask;
++                shader.flags = recompiler.composition ? 1u : 0u;
+ 
+                 thread_local DxcCompiler dxcCompiler;
+ 
+@@ -133,11 +140,30 @@ int main(int argc, char** argv)
+                 assert(*(reinterpret_cast<uint32_t *>(shader.dxil->GetBufferPointer()) + 1) != 0 && "DXIL was not signed properly!");
+ #endif
+ 
++                if (const char* dir = std::getenv("XENOS_RECOMP_HLSLDIR"))
++                    writeAllBytes(fmt::format("{}/{:016X}.hlsl", dir, hashShaderPair.first).c_str(), recompiler.out.data(), recompiler.out.size());
++
+                 IDxcBlob* spirv = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, false, true);
+-                assert(spirv != nullptr);
++                if (spirv == nullptr)
++                {
++                    // skipped, not fatal: it stays in the cache with no code, and its hlsl is kept for a look
++                    ++failures;
++                    if (const char* dir = std::getenv("XENOS_RECOMP_FAILDIR"))
++                        writeAllBytes(fmt::format("{}/{:016X}.hlsl", dir, hashShaderPair.first).c_str(), recompiler.out.data(), recompiler.out.size());
++                    ++progress;
++                    return;
++                }
+ 
+-                bool result = smolv::Encode(spirv->GetBufferPointer(), spirv->GetBufferSize(), shader.spirv, smolv::kEncodeFlagStripDebugInfo);
+-                assert(result);
++                if (binaryOut)
++                {
++                    shader.spirv.assign(reinterpret_cast<uint8_t*>(spirv->GetBufferPointer()),
++                        reinterpret_cast<uint8_t*>(spirv->GetBufferPointer()) + spirv->GetBufferSize());
++                }
++                else
++                {
++                    bool result = smolv::Encode(spirv->GetBufferPointer(), spirv->GetBufferSize(), shader.spirv, smolv::kEncodeFlagStripDebugInfo);
++                    assert(result);
++                }
+ 
+                 spirv->Release();
+ 
+@@ -146,6 +172,31 @@ int main(int argc, char** argv)
+                     fmt::println("Recompiling shaders... {}%", currentProgress / float(shaders.size()) * 100.0f);
+             });
+ 
++        fmt::println("{} shaders, {} failed to compile", shaders.size(), failures.load());
++
++        if (binaryOut)
++        {
++            // a cache a program loads at run time: "BDSC", version 4 (1 had 16 sampler slots per table, 2 integer normals, 3 no vertex index, 4 no computed-index fetches, 5 no texture exponent bias, 6 vertex point fetches filtered, 7 no fetch LOD, 8 no shader flags, 9 indexed fetches ignored the instruction's stride), count, then per shader {u64 container
++            // hash, u32 offset, u32 size, u32 spec constants mask, u32 flags (1: team-colour composition)}, then the plain SPIR-V, little-endian
++            std::vector<uint8_t> file;
++            auto put = [&](const void* p, size_t n) { file.insert(file.end(), (const uint8_t*)p, (const uint8_t*)p + n); };
++            const uint32_t head[3] = {0x43534442, 10, uint32_t(shaders.size())};
++            put(head, sizeof(head));
++            uint32_t offset = 0;
++            for (auto& [hash, shader] : shaders)
++            {
++                const uint64_t h = hash;
++                const uint32_t rest[4] = {offset, uint32_t(shader.spirv.size()), shader.specConstantsMask, shader.flags};
++                put(&h, sizeof(h));
++                put(rest, sizeof(rest));
++                offset += uint32_t(shader.spirv.size());
++            }
++            for (auto& [hash, shader] : shaders)
++                put(shader.spirv.data(), shader.spirv.size());
++            writeAllBytes(output, file.data(), file.size());
++            fmt::println("Wrote {} ({} bytes)", output, file.size());
++            return 0;
++        }
+         fmt::println("Creating shader cache...");
+ 
+         StringBuffer f;
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+index 1c74034..8d440a4 100644
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -17,6 +17,8 @@
+ 
+ #ifdef __spirv__
+ 
++// the shared constants hold 32 slots per table (vertex texture fetch uses 16 and up): texture 2D, 3D and cube
++// indices, sampler indices, then the values below
+ struct PushConstants
+ {
+     uint64_t VertexShaderConstants;
+@@ -26,24 +28,31 @@ struct PushConstants
+ 
+ [[vk::push_constant]] ConstantBuffer<PushConstants> g_PushConstants;
+ 
+-#define g_Booleans                 vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 256)
+-#define g_SwappedTexcoords         vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 260)
+-#define g_HalfPixelOffset          vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 264)
+-#define g_AlphaThreshold           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 272)
++#define g_Booleans                 vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 512)
++#define g_SwappedTexcoords         vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 516)
++#define g_HalfPixelOffset          vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 520)
++#define g_AlphaThreshold           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 528)
+ 
+ [[vk::constant_id(0)]] const uint g_SpecConstants = 0;
+ 
++// 2 to the power of each slot's fetch constant exponent bias, the scale its texture reads come back with
++#define g_TexScale(slot) vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 800 + (slot) * 4)
++// the fetch constant's LOD field (dword 4 bits 12-21, in 1/32): the level, or the bias when the GPU picks it
++#define g_TexLod(slot) vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 928 + (slot) * 4)
++
+ #define g_SpecConstants() g_SpecConstants
+ 
+ #else
+ 
+ #define DEFINE_SHARED_CONSTANTS() \
+-    uint g_Booleans : packoffset(c16.x); \
+-    uint g_SwappedTexcoords : packoffset(c16.y); \
+-    float2 g_HalfPixelOffset : packoffset(c16.z); \
+-    float g_AlphaThreshold : packoffset(c17.x);
++    uint g_Booleans : packoffset(c32.x); \
++    uint g_SwappedTexcoords : packoffset(c32.y); \
++    float2 g_HalfPixelOffset : packoffset(c32.z); \
++    float g_AlphaThreshold : packoffset(c33.x);
+ 
+ uint g_SpecConstants();
++#define g_TexScale(slot) 1.0
++#define g_TexLod(slot) 0.0
+ 
+ #endif
+ 
+@@ -59,10 +68,28 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
+     return dimensions;
+ }
+ 
++
++// a vertex shader has no derivatives to pick a mip level from: it reads level 0, as the 360's vertex fetch did
++#ifdef XENOS_VERTEX_SHADER
++#define XSAMPLE(TEX, SAMP, COORD) (TEX).SampleLevel(SAMP, COORD, 0)
++#else
++#define XSAMPLE(TEX, SAMP, COORD) (TEX).Sample(SAMP, COORD)
++#endif
++
+ float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
+ {
+     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
+-    return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture));
++    return XSAMPLE(texture, g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture));
++}
++
++// a vertex shader's fetch the instruction asks to point-sample (bone palettes and other data): the whole texel,
++// whatever filter the fetch constant has. snapped to 1/256 texel like sampler hardware, so n/w lands on n
++float4 tfetch2DPoint(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
++{
++    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
++    int2 dimensions = int2(getTexture2DDimensions(texture));
++    float2 texel = round((texCoord * dimensions + offset) * 256.0) / 256.0;
++    return texture.Load(int3(clamp(int2(floor(texel)), 0, dimensions - 1), 0));
+ }
+ 
+ float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
+@@ -135,17 +162,17 @@ float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex
+     float h1y = h1(fy);
+ 
+     float4 r =
+-        g0(fy) * (g0x * texture.Sample(samplerState, float2(px + h0x, py + h0y) / float2(dimensions)) +
+-            g1x * texture.Sample(samplerState, float2(px + h1x, py + h0y) / float2(dimensions))) +
+-        g1(fy) * (g0x * texture.Sample(samplerState, float2(px + h0x, py + h1y) / float2(dimensions)) +
+-            g1x * texture.Sample(samplerState, float2(px + h1x, py + h1y) / float2(dimensions)));
++        g0(fy) * (g0x * XSAMPLE(texture, samplerState, float2(px + h0x, py + h0y) / float2(dimensions)) +
++            g1x * XSAMPLE(texture, samplerState, float2(px + h1x, py + h0y) / float2(dimensions))) +
++        g1(fy) * (g0x * XSAMPLE(texture, samplerState, float2(px + h0x, py + h1y) / float2(dimensions)) +
++            g1x * XSAMPLE(texture, samplerState, float2(px + h1x, py + h1y) / float2(dimensions)));
+ 
+     return r;
+ }
+ 
+ float4 tfetch3D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord)
+ {
+-    return g_Texture3DDescriptorHeap[resourceDescriptorIndex].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord);
++    return XSAMPLE(g_Texture3DDescriptorHeap[resourceDescriptorIndex], g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord);
+ }
+ 
+ struct CubeMapData
+@@ -156,8 +183,108 @@ struct CubeMapData
+ 
+ float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, inout CubeMapData cubeMapData)
+ {
+-    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeMapData.cubeMapDirections[texCoord.z]);
++    return XSAMPLE(g_TextureCubeDescriptorHeap[resourceDescriptorIndex], g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeMapData.cubeMapDirections[texCoord.z]);
++}
++
++// a fetch's level: explicit (vertex shaders, or a pixel shader fetch with computed LOD off), or a bias on the
++// level the GPU computes. the sum is the fetch constant's field + the register set by setTexLOD + the
++// instruction's own bias
++float4 tfetch2DLod(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset, float lod)
++{
++    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
++    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture), lod);
++}
++
++float4 tfetch3DLod(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float lod)
++{
++    return g_Texture3DDescriptorHeap[resourceDescriptorIndex].SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord, lod);
++}
++
++float4 tfetchCubeLod(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, inout CubeMapData cubeMapData, float lod)
++{
++    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeMapData.cubeMapDirections[texCoord.z], lod);
++}
++
++#ifndef XENOS_VERTEX_SHADER
++float getCompTexLOD2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord)
++{
++    return g_Texture2DDescriptorHeap[resourceDescriptorIndex].CalculateLevelOfDetailUnclamped(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord);
++}
++
++float getCompTexLODCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, inout CubeMapData cubeMapData)
++{
++    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].CalculateLevelOfDetailUnclamped(g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeMapData.cubeMapDirections[texCoord.z]);
++}
++
++float4 tfetch2DBias(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset, float bias)
++{
++    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
++    return texture.SampleBias(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture), bias);
++}
++
++float4 tfetch3DBias(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float bias)
++{
++    return g_Texture3DDescriptorHeap[resourceDescriptorIndex].SampleBias(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord, bias);
++}
++
++float4 tfetchCubeBias(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, inout CubeMapData cubeMapData, float bias)
++{
++    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].SampleBias(g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeMapData.cubeMapDirections[texCoord.z], bias);
++}
++#endif
++
++
++#ifdef __spirv__
++// vertex fetches from a computed index: per input location, 16 bytes at SharedConstants + 544: the address of
++// the element in the first vertex, the stride, and the D3DDECLTYPE. the data is the draw's converted stream
++// (words swapped, 16-bit elements' halves too), so components read the way the vertex attributes do
++// stride: the fetch instruction's own, in bytes (what the 360 steps by); 0 falls back to the stream's
++float4 vfetchIndexed(uint location, float index, uint instrStride, bool rounded)
++{
++    uint64_t entry = g_PushConstants.SharedConstants + 544 + location * 16;
++    uint64_t base = vk::RawBufferLoad<uint64_t>(entry);
++    uint stride = instrStride != 0 ? instrStride : vk::RawBufferLoad<uint>(entry + 8);
++    uint type = vk::RawBufferLoad<uint>(entry + 12);
++    if (base == 0)
++        return float4(0.0, 0.0, 0.0, 1.0);
++    uint64_t at = base + uint64_t(uint(max(rounded ? round(index) : index, 0.0)) * stride);
++    uint w0 = vk::RawBufferLoad<uint>(at), w1 = vk::RawBufferLoad<uint>(at + 4);
++    uint w2 = vk::RawBufferLoad<uint>(at + 8), w3 = vk::RawBufferLoad<uint>(at + 12);
++    uint fmt = type & 0x3F;
++    bool sgn = (type & 0x100) != 0, unnormalized = (type & 0x200) != 0;
++    float4 v = float4(0.0, 0.0, 0.0, 1.0);
++    if (fmt == 0x24) v.x = asfloat(w0);
++    else if (fmt == 0x25) v.xy = asfloat(uint2(w0, w1));
++    else if (fmt == 0x39) v.xyz = asfloat(uint3(w0, w1, w2));
++    else if (fmt == 0x26) v = asfloat(uint4(w0, w1, w2, w3));
++    else if (fmt == 0x1F) v.xy = f16tof32(uint2(w0 & 0xFFFF, w0 >> 16));
++    else if (fmt == 0x20) v = f16tof32(uint4(w0 & 0xFFFF, w0 >> 16, w1 & 0xFFFF, w1 >> 16));
++    else if (fmt == 0x06)
++    {
++        uint4 b = uint4(w0 & 0xFF, (w0 >> 8) & 0xFF, (w0 >> 16) & 0xFF, w0 >> 24);
++        if (((type >> 10) & 0xFFF) == 0x60A) b = b.zyxw;  // D3DCOLOR
++        if (sgn) { int4 i = (int4(b << 24)) >> 24; v = unnormalized ? float4(i) : max(float4(i) / 127.0, -1.0); }
++        else v = unnormalized ? float4(b) : float4(b) / 255.0;
++    }
++    else if (fmt == 0x19 || fmt == 0x1A)
++    {
++        uint4 h = uint4(w0 & 0xFFFF, w0 >> 16, w1 & 0xFFFF, w1 >> 16);
++        if (sgn) { int4 i = (int4(h << 16)) >> 16; v = unnormalized ? float4(i) : max(float4(i) / 32767.0, -1.0); }
++        else v = unnormalized ? float4(h) : float4(h) / 65535.0;
++        if (fmt == 0x19) v.zw = float2(0.0, 1.0);
++    }
++    else if (fmt == 0x07)
++    {
++        uint4 b = uint4(w0 & 0x3FF, (w0 >> 10) & 0x3FF, (w0 >> 20) & 0x3FF, w0 >> 30);
++        if (sgn) { int4 i = int4(b.xyz << 22, b.w << 30) >> int4(22, 22, 22, 30); v = unnormalized ? float4(i) : max(float4(i) / float4(511.0, 511.0, 511.0, 1.0), -1.0); }
++        else v = unnormalized ? float4(b) : float4(b) / float4(1023.0, 1023.0, 1023.0, 3.0);
++    }
++    else if (fmt == 0x21) v.x = sgn ? float(asint(w0)) : float(w0);
++    else if (fmt == 0x22) v.xy = sgn ? float2(asint(uint2(w0, w1))) : float2(w0, w1);
++    else if (fmt == 0x23) v = sgn ? float4(asint(uint4(w0, w1, w2, w3))) : float4(w0, w1, w2, w3);
++    return v;
+ }
++#endif
+ 
+ float4 tfetchR11G11B10(uint4 value)
+ {
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index 698a418..ea5998b 100644
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -18,11 +18,11 @@ static constexpr const char* USAGE_TYPES[] =
+     "float4", // POSITION
+     "float4", // BLENDWEIGHT
+     "uint4", // BLENDINDICES
+-    "uint4", // NORMAL
++    "float4", // NORMAL (NHL 14's are DEC3N, normalized: they come in as floats)
+     "float4", // PSIZE
+     "float4", // TEXCOORD
+-    "uint4", // TANGENT
+-    "uint4", // BINORMAL
++    "float4", // TANGENT
++    "float4", // BINORMAL
+     "float4", // TESSFACTOR
+     "float4", // POSITIONT
+     "float4", // COLOR
+@@ -179,15 +179,46 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+     auto findResult = vertexElements.find(address);
+     assert(findResult != vertexElements.end());
+ 
+-    switch (findResult->second.usage)
++    // a fetch from an index the shader worked out itself (a sprite's corner, a crowd member's vertex) can't be
++    // a vertex attribute: it reads the stream directly, through the per-draw table vfetchIndexed looks in
++    if (!instr.isMiniFetch)
+     {
+-    case DeclUsage::Normal:
+-    case DeclUsage::Tangent:
+-    case DeclUsage::Binormal:
+-        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL;
+-        print("tfetchR11G11B10(");
+-        break;
++        lastFetchIndex = fmt::format("r{}.{}", uint32_t(instr.srcRegister), SWIZZLES[instr.srcSwizzle]);
++        // mini fetches share the full fetch's stride and rounding
++        lastFetchStride = instr.stride * 4;
++        lastFetchRounded = instr.isIndexRounded;
++    }
++    // r0.x itself goes through the attributes even once r0 has been written elsewhere: the crowd's case, where it
++    // is, is covered by repeating the stream instead
++    const bool computedIndex = !isPixelShader && lastFetchIndex != "r0.x";
++    if (computedIndex)
++    {
++        int location = -1;
++        for (auto& usageLocation : USAGE_LOCATIONS)
++            if (usageLocation.usage == findResult->second.usage && usageLocation.usageIndex == findResult->second.usageIndex)
++                location = int(usageLocation.location);
++        if (location >= 0)
++        {
++            print("vfetchIndexed({}, {}, {}, {}).", location, lastFetchIndex, lastFetchStride, lastFetchRounded ? "true" : "false");
++            printDstSwizzle(instr.dstSwizzle, true);
++            out += ";\n";
++            printDstSwizzle01(instr.dstRegister, instr.dstSwizzle);
++            if (instr.dstRegister == 0)
++                r0Written = true;
++            if (instr.isPredicated)
++            {
++                --indentation;
++                indent();
++                out += "}\n";
++            }
++            return;
++        }
++    }
++    if (instr.dstRegister == 0)
++        r0Written = true;
+ 
++    switch (findResult->second.usage)
++    {
+     case DeclUsage::TexCoord:
+         print("tfetchTexcoord(g_SwappedTexcoords, ");
+         break;
+@@ -197,12 +228,6 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+ 
+     switch (findResult->second.usage)
+     {
+-    case DeclUsage::Normal:
+-    case DeclUsage::Tangent:
+-    case DeclUsage::Binormal:
+-        out += ')';
+-        break;
+-
+     case DeclUsage::TexCoord:
+         print(", {})", uint32_t(findResult->second.usageIndex));
+         break;
+@@ -225,7 +250,22 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+ 
+ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicubic)
+ {
+-    if (instr.opcode != FetchOpcode::TextureFetch && instr.opcode != FetchOpcode::GetTextureWeights)
++    if (instr.opcode == FetchOpcode::SetTextureLod)
++    {
++        // the level later fetches with the register LOD flag add on
++        indent();
++        print("texLod = r{}.", instr.srcRegister);
++        out += SWIZZLES[instr.srcSwizzle & 0x3];
++        out += ";\n";
++        return;
++    }
++
++    // the level the GPU would pick here (pixel shaders only): shaders work out their own LOD from it and hand
++    // it back through setTexLOD
++    const bool computedLodQuery = instr.opcode == FetchOpcode::GetTextureComputedLod && isPixelShader &&
++                                  (instr.dimension == TextureDimension::Texture2D ||
++                                   instr.dimension == TextureDimension::TextureCube);
++    if (instr.opcode != FetchOpcode::TextureFetch && instr.opcode != FetchOpcode::GetTextureWeights && !computedLodQuery)
+         return;
+ 
+     if (instr.isPredicated)
+@@ -265,6 +305,7 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+     {
+         constName = fmt::format("s{}", instr.constIndex);
+         constNamePtr = constName.c_str();
++        undeclaredSamplers.insert(instr.constIndex);
+     }
+ 
+ #ifdef UNLEASHED_RECOMP
+@@ -277,6 +318,34 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+     }
+ #endif
+ 
++    if (computedLodQuery)
++    {
++        indent();
++        print("r{}.", instr.dstRegister);
++        printDstSwizzle(instr.dstSwizzle, false);
++        if (instr.dimension == TextureDimension::Texture2D)
++        {
++            print(" = float4(getCompTexLOD2D({0}_Texture2DDescriptorIndex, {0}_SamplerDescriptorIndex, ", constNamePtr);
++            printSrcRegister(2);
++        }
++        else
++        {
++            print(" = float4(getCompTexLODCube({0}_TextureCubeDescriptorIndex, {0}_SamplerDescriptorIndex, ", constNamePtr);
++            printSrcRegister(3);
++            out += ", cubeMapData";
++        }
++        out += "), 0.0, 0.0, 0.0).";
++        printDstSwizzle(instr.dstSwizzle, true);
++        out += ";\n";
++        if (instr.isPredicated)
++        {
++            --indentation;
++            indent();
++            out += "}\n";
++        }
++        return;
++    }
++
+     indent();
+     print("r{}.", instr.dstRegister);
+     printDstSwizzle(instr.dstSwizzle, false);
+@@ -291,7 +360,8 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+             out += "1.0 - ";
+     #endif
+ 
+-        out += "tfetch";
++        // the fetch constant's exponent bias scales what comes back (g_TexScale, per slot)
++        out += "(tfetch";
+         break;
+     }
+     case FetchOpcode::GetTextureWeights:
+@@ -326,6 +396,27 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+ 
+     out += dimension;
+ 
++    // the instruction can override the fetch constant's filter; 0 = point
++    const bool point = instr.opcode == FetchOpcode::TextureFetch && !isPixelShader &&
++                       instr.dimension == TextureDimension::Texture2D && instr.magFilter == 0 && instr.minFilter == 0;
++    // the level: the GPU computes it only in pixel shaders (or from register gradients), and only when the
++    // instruction asks; otherwise it's explicit
++    std::string lod;
++    bool computedLod = false;
++    if (instr.opcode == FetchOpcode::TextureFetch && !point && instr.dimension != TextureDimension::Texture1D)
++    {
++        computedLod = instr.useCompLod && (isPixelShader || instr.useRegGradients);
++        lod = fmt::format("g_TexLod({})", uint32_t(instr.constIndex));
++        if (instr.useRegLod)
++            lod += " + texLod";
++        if (instr.lodBias)
++            lod += fmt::format(" + {}", instr.lodBias / 16.0f);
++    }
++    if (point)
++        out += "Point";
++    else if (!lod.empty())
++        out += computedLod ? "Bias" : "Lod";
++
+ #ifdef UNLEASHED_RECOMP
+     if (bicubic)
+         out += "Bicubic";
+@@ -344,7 +435,13 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+         break;
+     }
+ 
+-    out += ").";
++    if (!lod.empty() && !point)
++        print(", {}", lod);
++
++    if (instr.opcode == FetchOpcode::TextureFetch)
++        print(") * g_TexScale({})).", uint32_t(instr.constIndex));
++    else
++        out += ").";
+ 
+     printDstSwizzle(instr.dstSwizzle, true);
+ 
+@@ -678,6 +775,8 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+         else
+         {
+             print("r{}.", instr.vectorDest);
++            if (instr.vectorDest == 0)
++                r0Written = true;
+         }
+ 
+         for (size_t i = 0; i < 4; i++)
+@@ -1045,6 +1144,8 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+         else
+         {
+             print("r{}.", instr.scalarDest);
++            if (instr.scalarDest == 0)
++                r0Written = true;
+         }
+ 
+         for (size_t i = 0; i < 4; i++)
+@@ -1105,11 +1206,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+     assert((shaderContainer->flags & 0xFFFFFF00) == 0x102A1100);
+     assert(shaderContainer->constantTableOffset != NULL);
+ 
++    isPixelShader = (shaderContainer->flags & 0x1) == 0;
++    if (!isPixelShader)
++        out += "#define XENOS_VERTEX_SHADER\n";
++
+     out += include;
+     out += '\n';
+ 
+-    isPixelShader = (shaderContainer->flags & 0x1) == 0;
+-
+     const auto constantTableContainer = reinterpret_cast<const ConstantTableContainer*>(shaderData + shaderContainer->constantTableOffset);
+     constantTableData = reinterpret_cast<const uint8_t*>(&constantTableContainer->constantTable);
+ 
+@@ -1126,6 +1229,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             constantTableData + constantTableContainer->constantTable.constantInfo + i * sizeof(ConstantInfo));
+ 
+         const char* constantName = reinterpret_cast<const char*>(constantTableData + constantInfo->name);
++        if (strncmp(constantName, "recolor", 7) == 0)
++            composition = true;
+ 
+     #ifdef UNLEASHED_RECOMP
+         if (!isPixelShader)
+@@ -1174,11 +1279,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
+             {
+                 println("#define {}_Texture{}DescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+-                    constantName, TEXTURE_DIMENSIONS[j], j * 64 + constantInfo->registerIndex * 4);
++                    constantName, TEXTURE_DIMENSIONS[j], j * 128 + constantInfo->registerIndex * 4);
+             }
+ 
+             println("#define {}_SamplerDescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+-                constantName, std::size(TEXTURE_DIMENSIONS) * 64 + constantInfo->registerIndex * 4);
++                constantName, std::size(TEXTURE_DIMENSIONS) * 128 + constantInfo->registerIndex * 4);
+ 
+             samplers.emplace(constantInfo->registerIndex, constantName);
+             break;
+@@ -1233,11 +1338,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
+             {
+                 println("\tuint {}_Texture{}DescriptorIndex : packoffset(c{}.{});",
+-                    constantName, TEXTURE_DIMENSIONS[j], j * 4 + constantInfo->registerIndex / 4, SWIZZLES[constantInfo->registerIndex % 4]);
++                    constantName, TEXTURE_DIMENSIONS[j], j * 8 + constantInfo->registerIndex / 4, SWIZZLES[constantInfo->registerIndex % 4]);
+             }
+ 
+             println("\tuint {}_SamplerDescriptorIndex : packoffset(c{}.{});",
+-                constantName, 4 * std::size(TEXTURE_DIMENSIONS) + constantInfo->registerIndex / 4, SWIZZLES[constantInfo->registerIndex % 4]);
++                constantName, 8 * std::size(TEXTURE_DIMENSIONS) + constantInfo->registerIndex / 4, SWIZZLES[constantInfo->registerIndex % 4]);
+         }
+     }
+ 
+@@ -1302,6 +1407,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+     else
+     {
+         auto vertexShader = reinterpret_cast<const VertexShader*>(shader);
++        // the same input can be listed at several fetch addresses: declared once, every address mapped to it
++        std::set<uint32_t> declaredInputs;
+         for (uint32_t i = 0; i < vertexShader->vertexElementCount; i++)
+         {
+             union
+@@ -1322,6 +1429,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             }
+         #endif
+ 
++            if (!declaredInputs.insert(uint32_t(vertexElement.usage) << 8 | uint32_t(vertexElement.usageIndex)).second)
++            {
++                vertexElements.emplace(uint32_t(vertexElement.address), vertexElement);
++                continue;
++            }
++
+             out += '\t';
+ 
+             for (auto& usageLocation : USAGE_LOCATIONS)
+@@ -1345,6 +1458,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             out += "\tin uint iVertexId : SV_VertexID,\n";
+             out += "\tin uint iInstanceId : SV_InstanceID,\n";
+         }
++    #else
++        // the 360 starts every vertex shader with the vertex index in r0.x (instanced meshes, the crowd, work
++        // out which instance they are from it)
++        out += "\tin uint iVertexId : SV_VertexID,\n";
+     #endif
+ 
+         out += "\tout float4 oPos : SV_Position";
+@@ -1471,6 +1588,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             {
+                 out += "float4(iVertexId + g_IndexCount.x * iInstanceId, 0.0, 0.0, 0.0);\n";
+             }
++        #else
++            else if (!isPixelShader && i == 0)
++            {
++                out += "float4(iVertexId, 0.0, 0.0, 0.0);\n";
++            }
+         #endif
+             else
+             {
+@@ -1483,6 +1605,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+     out += "\tint aL = 0;\n";
+     out += "\tbool p0 = false;\n";
+     out += "\tfloat ps = 0.0;\n";
++    out += "\tfloat texLod = 0.0;\n";
+     if (isPixelShader)
+     {
+ #ifdef UNLEASHED_RECOMP
+@@ -1698,7 +1821,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                         if (findResult != boolConstants.end())
+                             println("if ((g_Booleans & {}) {}= 0)", findResult->second, cfInstr.condJmp.condition ^ simpleControlFlow ? "!" : "=");
+                         else
+-                            println("if (b{} {}= 0)", uint32_t(cfInstr.condJmp.boolAddress), cfInstr.condJmp.condition ^ simpleControlFlow ? "!" : "=");
++                        {
++                            // not in the constant table: the same packed bit a declared one would get (vertex bits 0-15,
++                            // pixel 16-31; the 360 numbers pixel booleans from 128). beyond the 16 packed per stage: off
++                            uint32_t local = uint32_t(cfInstr.condJmp.boolAddress) % 128;
++                            if (local < 16)
++                                println("if ((g_Booleans & (1 << {})) {}= 0)", local + (isPixelShader ? 16 : 0), cfInstr.condJmp.condition ^ simpleControlFlow ? "!" : "=");
++                            else
++                                println("if (0 {}= 0)", cfInstr.condJmp.condition ^ simpleControlFlow ? "!" : "=");
++                        }
+                     }
+ 
+                     if (simpleControlFlow)
+@@ -1885,4 +2016,22 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ #endif
+ 
+     out += "}";
++
++    // fetch slots the constant table didn't name (vertex texture fetch uses 16 and up): declare them the same
++    // way, in the spir-v block, where the named ones went
++    if (!undeclaredSamplers.empty())
++    {
++        std::string defines;
++        for (uint32_t index : undeclaredSamplers)
++        {
++            for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
++                defines += fmt::format("#define s{}_Texture{}DescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})\n",
++                    index, TEXTURE_DIMENSIONS[j], j * 128 + index * 4);
++            defines += fmt::format("#define s{}_SamplerDescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})\n",
++                index, std::size(TEXTURE_DIMENSIONS) * 128 + index * 4);
++        }
++        const std::string marker = "#ifdef __spirv__\n\n";
++        if (size_t at = out.find(marker); at != std::string::npos)
++            out.insert(at + marker.size(), defines);
++    }
+ }
+diff --git a/XenosRecomp/shader_recompiler.h b/XenosRecomp/shader_recompiler.h
+index b2e317d..79758aa 100644
+--- a/XenosRecomp/shader_recompiler.h
++++ b/XenosRecomp/shader_recompiler.h
+@@ -1,3 +1,4 @@
++#include <set>
+ #pragma once
+ 
+ #include "shader.h"
+@@ -25,14 +26,24 @@ struct ShaderRecompiler : StringBuffer
+ {
+     uint32_t indentation = 0;
+     bool isPixelShader = false;
++    // whether r0 (the vertex index, in a vertex shader) has been written yet, and the last full vertex fetch's
++    // index, which mini fetches reuse
++    bool r0Written = false;
++    std::string lastFetchIndex;
++    uint32_t lastFetchStride = 0;  // in bytes, from the fetch instruction; 0 = the stream's
++    bool lastFetchRounded = false;
+     const uint8_t* constantTableData = nullptr;
+     std::unordered_map<uint32_t, VertexElement> vertexElements;
+     std::unordered_map<uint32_t, std::string> interpolators;
+     std::unordered_map<uint32_t, const ConstantInfo*> float4Constants;
+     std::unordered_map<uint32_t, const char*> boolConstants;
+     std::unordered_map<uint32_t, const char*> samplers;
++    // fetch slots used without a constant-table entry: declared after the fact
++    std::set<uint32_t> undeclaredSamplers;
+     std::unordered_map<uint32_t, uint32_t> ifEndLabels;
+     uint32_t specConstantsMask = 0;
++    // the game's team-colour composition (recolor_* inputs): drawn at load, read back by the CPU
++    bool composition = false;
+ 
+ #ifdef UNLEASHED_RECOMP
+     bool hasMtxProjection = false;

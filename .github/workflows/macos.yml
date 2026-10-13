@@ -1,0 +1,187 @@
+name: macos
+
+# the macOS build. there's no Mac here, so this is the only place it gets made. macOS runners bill at ten
+# times the minutes on a private repo, so it runs when asked or for a tag, never on an ordinary push.
+# generated/ isn't in the repo: scripts/ci-generated.sh attaches it, encrypted, to the ci-generated release.
+# one app for every Mac: built on an Apple Silicon and an Intel runner side by side, then joined into a
+# universal app, so it doesn't matter which Mac it lands on
+on:
+  workflow_dispatch:
+  push:
+    # ci-mac-* builds a branch that isn't on main yet (a manual run needs the workflow on the default branch)
+    tags: ['v*', 'ci-mac-*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-26
+            flags: ''
+          - arch: x86_64
+            runner: macos-26-intel
+            flags: -march=x86-64-v2
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    env:
+      ARCH: ${{ matrix.arch }}
+      CPU_FLAGS: ${{ matrix.flags }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Tools
+        run: brew install ninja vulkan-loader molten-vk ccache zstd
+
+      - name: Patches
+        run: |
+          git -C third_party/rexglue-sdk apply ../../sdk/bardown-sdk.patch
+          git -C third_party/XenosRecomp apply ../../sdk/xenosrecomp.patch
+
+      # pinned to a commit, not a tag a third party can move; and set up before generated/ is decrypted
+      - name: Compiler cache
+        uses: hendrikmuhs/ccache-action@33522472633dbd32578e909b315f5ee43ba878ce # v1.2.22
+        with:
+          key: macos-${{ matrix.arch }}
+          max-size: 3G
+
+      - name: Generated code
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GENERATED_KEY: ${{ secrets.GENERATED_KEY }}
+        run: |
+          gh release download ci-generated -R "$GITHUB_REPOSITORY" -p generated.tar.zst.gpg
+          printf '%s' "$GENERATED_KEY" > key && chmod 600 key
+          gpg --batch --passphrase-file key -d generated.tar.zst.gpg | zstd -d | tar -x
+          rm key generated.tar.zst.gpg
+          ls generated/default | wc -l
+
+      - name: SDK
+        run: |
+          cmake -S third_party/rexglue-sdk -B sdk-build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES="$ARCH" -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 \
+            -DCMAKE_C_FLAGS="$CPU_FLAGS" -DCMAKE_CXX_FLAGS="$CPU_FLAGS" \
+            -DCMAKE_C_COMPILER=/usr/bin/clang -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_INSTALL_PREFIX="$PWD/sdk-install"
+          cmake --build sdk-build --target install --parallel
+
+      - name: Shader translator
+        run: |
+          cmake -S third_party/XenosRecomp -B xr-build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+            -DCMAKE_OSX_ARCHITECTURES="$ARCH" -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 \
+            -DCMAKE_C_COMPILER=/usr/bin/clang -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          cmake --build xr-build --parallel
+
+      - name: bardown
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBARDOWN_SKIP_CODEGEN=ON \
+            -DCMAKE_OSX_ARCHITECTURES="$ARCH" -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 \
+            -DCMAKE_C_FLAGS="$CPU_FLAGS" -DCMAKE_CXX_FLAGS="$CPU_FLAGS" \
+            -DCMAKE_C_COMPILER=/usr/bin/clang -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -Drexglue_DIR="$PWD/sdk-install/lib/cmake/rexglue"
+          cmake --build build --parallel 3 -- -k 0
+
+      # everything the program loads sits beside it in the app's Contents/MacOS, and the loader is pointed there
+      - name: Gather
+        run: |
+          out="mac-$ARCH"
+          mkdir -p "$out"
+          cp build/bardown "$out/"
+          cp sdk-install/lib/librexruntime.dylib build/librexgpu-native.dylib build/librexgpu-xenos.dylib "$out/"
+          if [ -d build/vulkan ]; then cp -R build/vulkan "$out/"; fi
+          cp xr-build/XenosRecomp/XenosRecomp "$out/xenosrecomp"
+          cp third_party/XenosRecomp/thirdparty/dxc-bin/lib/arm64/libdxcompiler.dylib "$out/"
+          cp third_party/XenosRecomp/XenosRecomp/shader_common.h "$out/"
+          for f in "$out/bardown" "$out/xenosrecomp" "$out"/*.dylib; do
+            install_name_tool -add_rpath @executable_path "$f" 2>/dev/null || true
+          done
+          otool -L "$out/bardown" "$out/xenosrecomp"
+          tar -cf "mac-$ARCH.tar" "$out"
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: mac-${{ matrix.arch }}
+          path: mac-${{ matrix.arch }}.tar
+          retention-days: 3
+
+  package:
+    needs: build
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: mac-*
+          merge-multiple: true
+
+      # each program and library joined into one universal file; ones that already are (the shader compiler)
+      # and plain files are copied as they are
+      - name: Universal
+        run: |
+          tar -xf mac-arm64.tar
+          tar -xf mac-x86_64.tar
+          app=dist/bardown.app
+          bin="$app/Contents/MacOS"
+          mkdir -p "$bin" "$app/Contents/Resources"
+          (cd mac-arm64 && find . -type f) | while read -r f; do
+            a="mac-arm64/$f" x="mac-x86_64/$f" o="$bin/$f"
+            mkdir -p "$(dirname "$o")"
+            if [ -f "$x" ] && file "$a" | grep -q Mach-O && [ "$(lipo -archs "$a")" != "$(lipo -archs "$x")" ] \
+               && ! lipo -archs "$a" | grep -q ' '; then
+              lipo -create "$a" "$x" -output "$o"
+            else
+              cp "$a" "$o"
+            fi
+          done
+          (cd mac-arm64 && find . -type l) | while read -r f; do cp -P "mac-arm64/$f" "$bin/$f"; done
+          chmod +x "$bin/bardown" "$bin/xenosrecomp"
+          lipo -info "$bin/bardown" "$bin/librexruntime.dylib" "$bin/xenosrecomp"
+
+      - name: bardown.app
+        run: |
+          app=dist/bardown.app
+          mkdir -p icon.iconset
+          for s in 16 32 128 256 512; do
+            sips -z $s $s packaging/bardown.png --out icon.iconset/icon_${s}x${s}.png > /dev/null
+            sips -z $((s*2)) $((s*2)) packaging/bardown.png --out icon.iconset/icon_${s}x${s}@2x.png > /dev/null
+          done
+          iconutil -c icns icon.iconset -o "$app/Contents/Resources/bardown.icns"
+          version="${GITHUB_REF_NAME#v}"
+          cat > "$app/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleName</key><string>bardown</string>
+            <key>CFBundleExecutable</key><string>bardown</string>
+            <key>CFBundleIdentifier</key><string>org.enoki.bardown</string>
+            <key>CFBundleIconFile</key><string>bardown</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${version}</string>
+            <key>LSMinimumSystemVersion</key><string>13.3</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict></plist>
+          PLIST
+          # an ad-hoc signature: not notarised, but Apple Silicon won't run an unsigned arm64 binary at all
+          codesign --force --deep --sign - "$app"
+
+      - name: The .dmg
+        run: |
+          ln -s /Applications dist/Applications
+          cp packaging/licenses/*.txt dist/ 2>/dev/null || true
+          hdiutil create -volname bardown -srcfolder dist -ov -format UDZO bardown-macos-universal.dmg
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: bardown-macos-universal
+          path: bardown-macos-universal.dmg
+          retention-days: 14

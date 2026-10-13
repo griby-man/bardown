@@ -1,0 +1,17 @@
+# game data never goes in the repo
+dumps/
+*.iso
+*.xex
+*.xexp
+
+# codegen output is built from your own dump
+generated/*
+!generated/rexglue.cmake
+
+out/
+build/
+build-*/
+CMakeUserPresets.json
+logs/
+
+dist/

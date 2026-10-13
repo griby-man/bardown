@@ -1,0 +1,639 @@
+# EA CRT setjmp/longjmp. checked against the generated code:
+#   0x83075BF0 saves f14-f31 + r13-r31 into the buffer at r3, restores nothing (26 callers)
+#   0x83073980 reloads them all from r3, forces a 0 value to 1 (78 callers)
+setjmp_address = 0x83075BF0
+longjmp_address = 0x83073980
+
+# function entries the scanner misses. all four are reached only by a tail-call `b`,
+# so discovery never registers them and validate reports UnresolvedCall.
+
+[functions]
+0x82E5EE90 = { name = "sub_82E5EE90" }  # b from 0x82E84BD4
+0x82E73DD0 = { name = "sub_82E73DD0" }  # b from 0x82E73EE4
+0x82E89E18 = { name = "sub_82E89E18" }  # b from 0x82E8C114
+0x82EB9DB8 = { name = "sub_82EB9DB8" }  # b from 0x82EE4FC4
+
+# gapfill splits these in two: a caller-less sub_ lands mid-function and takes the labels
+# the real body jumps to, so the build fails with undeclared loc_ labels. end = next real function.
+0x82A66508 = { name = "sub_82A66508", end = 0x82A67600 }  # swallows sub_82A67248
+0x82BBF100 = { name = "sub_82BBF100", end = 0x82BBF558 }  # swallows sub_82BBF3A8
+
+# boot fatals and harvest runs (scripts/run.sh harvest)
+0x826EB878 = { name = "sub_826EB878" }  # .big mount sequence
+
+# tools/scan_code_refs.py on the loaded image: code addresses stored in data with no
+# function behind them. kept only when the previous instruction is b/blr/padding (so no
+# fallthrough into it) and nothing branches to it as a label inside another function
+0x824B06B0 = { name = "sub_824B06B0" }  # after b; data refs 82322EEC
+0x824C3098 = { name = "sub_824C3098" }  # after b; data refs 82324830
+0x82524684 = { name = "sub_82524684" }  # after blr; data refs 83E532A4
+0x825BDA08 = { name = "sub_825BDA08" }  # after b; data refs 8233DF08,8233DFF8
+0x826A6528 = { name = "sub_826A6528" }  # after b; data refs 83B1C200,83B1C2C4
+0x82725080 = { name = "sub_82725080" }  # after b; data refs 820C6478,820C6488,820C64B0,822BC53C...
+0x82759730 = { name = "sub_82759730" }  # after b; data refs 83B1B020
+0x8279BF18 = { name = "sub_8279BF18" }  # after b; data refs 82396280
+0x828092B0 = { name = "sub_828092B0" }  # after b; data refs 8239A39C
+0x82851A70 = { name = "sub_82851A70" }  # after b; data refs 822E6DFC
+0x8288FFF8 = { name = "sub_8288FFF8" }  # mflr r12; data refs 823B8810
+0x828922D8 = { name = "sub_828922D8" }  # after b; data refs 823A0AD0
+0x82893AAC = { name = "sub_82893AAC" }  # after b; data refs 823A0B18
+0x82893C24 = { name = "sub_82893C24" }  # after b; data refs 823A0B28
+0x82893DF0 = { name = "sub_82893DF0" }  # after blr; data refs 823B8948
+0x82893E40 = { name = "sub_82893E40" }  # after blr; data refs 823B8950
+0x8289475C = { name = "sub_8289475C" }  # after b; data refs 823A0B68
+0x828B7A98 = { name = "sub_828B7A98" }  # after b; data refs 8201C6BC
+0x82913C50 = { name = "sub_82913C50" }  # after b; data refs 82022280
+0x82977E08 = { name = "sub_82977E08" }  # after b; data refs 820383E0
+0x8297E948 = { name = "sub_8297E948" }  # after b; data refs 8203772C
+0x829BA340 = { name = "sub_829BA340" }  # after b; data refs 82044E38
+0x829BA348 = { name = "sub_829BA348" }  # after b; data refs 82044E44
+0x829BAF48 = { name = "sub_829BAF48" }  # after b; data refs 82044EBC
+0x829BAF50 = { name = "sub_829BAF50" }  # after b; data refs 82044EC0
+0x829BAF58 = { name = "sub_829BAF58" }  # after b; data refs 82044EC4
+0x829BAF60 = { name = "sub_829BAF60" }  # after b; data refs 82044EC8
+0x829BAF68 = { name = "sub_829BAF68" }  # after b; data refs 82044ECC
+0x829BAF70 = { name = "sub_829BAF70" }  # after b; data refs 82044ED0
+0x829BAF78 = { name = "sub_829BAF78" }  # after b; data refs 82044ED4
+0x829BAF80 = { name = "sub_829BAF80" }  # after b; data refs 82044ED8
+0x829BAF90 = { name = "sub_829BAF90" }  # after b; data refs 82044EE0
+0x829BAF98 = { name = "sub_829BAF98" }  # after b; data refs 82044EE4
+0x829BAFB0 = { name = "sub_829BAFB0" }  # after b; data refs 82044EF0
+0x829BAFB8 = { name = "sub_829BAFB8" }  # after b; data refs 82044E98
+0x829BB0E8 = { name = "sub_829BB0E8" }  # after b; data refs 82044F2C
+0x829BB0F8 = { name = "sub_829BB0F8" }  # after b; data refs 82044F30
+0x829C3098 = { name = "sub_829C3098" }  # after b; data refs 82045B74
+0x829C3128 = { name = "sub_829C3128" }  # after b; data refs 82045B90
+0x829C3168 = { name = "sub_829C3168" }  # after b; data refs 82045B9C
+0x829C3268 = { name = "sub_829C3268" }  # after b; data refs 82045BA4
+0x829C3270 = { name = "sub_829C3270" }  # after b; data refs 82045BAC
+0x829DBD98 = { name = "sub_829DBD98" }  # after b; data refs 82048824
+0x829DBE78 = { name = "sub_829DBE78" }  # after b; data refs 82048858
+0x829DBE90 = { name = "sub_829DBE90" }  # after b; data refs 82048864
+0x829DBEA0 = { name = "sub_829DBEA0" }  # after b; data refs 820488C0
+0x82A57BB0 = { name = "sub_82A57BB0" }  # after b; data refs 8206116C
+0x82C555A0 = { name = "sub_82C555A0" }  # after b; data refs 820947A8
+0x82CBDB90 = { name = "sub_82CBDB90" }  # after b; data refs 820A0888
+0x82CDEC28 = { name = "sub_82CDEC28" }  # after b; data refs 820A19B8
+0x82CF8138 = { name = "sub_82CF8138" }  # after b; data refs 820A387C
+0x82D386D0 = { name = "sub_82D386D0" }  # after b; data refs 820AA850
+0x82D43888 = { name = "sub_82D43888" }  # after b; data refs 820ABF48
+0x82DE1670 = { name = "sub_82DE1670" }  # after b; data refs 820C226C
+0x82DE5878 = { name = "sub_82DE5878" }  # after b; data refs 820C1B0C
+0x82DEE210 = { name = "sub_82DEE210" }  # after b; data refs 820C51E4
+0x82DEF120 = { name = "sub_82DEF120" }  # after b; data refs 820C525C
+0x82E5EE68 = { name = "sub_82E5EE68" }  # after b; data refs 820DBBA0,820DD380
+0x82E5EE70 = { name = "sub_82E5EE70" }  # after b; data refs 820DBB88,820DD368
+0x82E5EE80 = { name = "sub_82E5EE80" }  # after b; data refs 820DBBB0
+0x82E73EF0 = { name = "sub_82E73EF0" }  # after b; data refs 820DD398
+0x82E73EF8 = { name = "sub_82E73EF8" }  # after b; data refs 820DD394
+0x82E73F00 = { name = "sub_82E73F00" }  # after b; data refs 820DD390
+0x82E78440 = { name = "sub_82E78440" }  # after b; data refs 820DDD80
+0x82E847D8 = { name = "sub_82E847D8" }  # after b; data refs 820DDE10
+0x82E847F0 = { name = "sub_82E847F0" }  # after b; data refs 820DDDE8,820DDF30,820DE248
+0x82E847F8 = { name = "sub_82E847F8" }  # after b; data refs 820DDDD4,820DDF1C,820DE234
+0x82E84808 = { name = "sub_82E84808" }  # after b; data refs 820DDDEC,820DDF34,820DE24C
+0x82E84810 = { name = "sub_82E84810" }  # after b; data refs 820DDDDC,820DDF24,820DE23C
+0x82E84C50 = { name = "sub_82E84C50" }  # after b; data refs 820DDDD0,820DDF18,820DE230
+0x82E89E10 = { name = "sub_82E89E10" }  # after b; data refs 820DE268
+0x82E98108 = { name = "sub_82E98108" }  # after b; data refs 820DF74C
+0x82ECA2F8 = { name = "sub_82ECA2F8" }  # after b; data refs 820E65F0
+0x82ECA4A8 = { name = "sub_82ECA4A8" }  # after b; data refs 820E665C
+0x82ECA5B8 = { name = "sub_82ECA5B8" }  # after b; data refs 820E6674
+0x82ED8B70 = { name = "sub_82ED8B70" }  # after b; data refs 820E6C10
+0x82EF5260 = { name = "sub_82EF5260" }  # after b; data refs 820E6E54
+0x82F29928 = { name = "sub_82F29928" }  # after b; data refs 820EF560
+0x82F29BE0 = { name = "sub_82F29BE0" }  # after b; data refs 820EF630
+0x82F29C78 = { name = "sub_82F29C78" }  # after b; data refs 820EF644
+0x82F29D08 = { name = "sub_82F29D08" }  # after b; data refs 820EF654
+0x82FA67C8 = { name = "sub_82FA67C8" }  # after b; data refs 820F9584
+0x83007038 = { name = "sub_83007038" }  # after b; data refs 83A45E7C
+0x8306CCD0 = { name = "sub_8306CCD0" }  # after padding; data refs 823EFF38
+0x8306CF68 = { name = "sub_8306CF68" }  # after blr; data refs 823EFF40
+0x8306D200 = { name = "sub_8306D200" }  # after blr; data refs 823EFF48
+0x8306D24C = { name = "sub_8306D24C" }  # after blr; data refs 823EFF50
+0x83081BE0 = { name = "sub_83081BE0" }  # after b; data refs 823A0FB8
+0x83084080 = { name = "sub_83084080" }  # after b; data refs 82133AE8
+0x83086568 = { name = "sub_83086568" }  # after b; data refs 82133BA0,82133CC8,82133E70,82133F10...
+0x83086570 = { name = "sub_83086570" }  # after b; data refs 82133B98,82133CC0,82133E68,82133F08...
+0x83086578 = { name = "sub_83086578" }  # after b; data refs 82133BD4
+0x83086588 = { name = "sub_83086588" }  # after b; data refs 82133BC8,82133CF0,82133E98,82133F38...
+0x83086590 = { name = "sub_83086590" }  # after b; data refs 82133BF4,82133D1C,82133EC4
+0x8308B718 = { name = "sub_8308B718" }  # after b; data refs 82133F44
+0x8308B728 = { name = "sub_8308B728" }  # after b; data refs 82133BBC,82133CE4,82133E8C,82133F2C...
+0x8308B730 = { name = "sub_8308B730" }  # after b; data refs 82133F28,82133FA0
+0x8308B738 = { name = "sub_8308B738" }  # after b; data refs 82133BA4,82133CCC,82133E74,82133F14...
+0x8308B740 = { name = "sub_8308B740" }  # after b; data refs 82133BA8,82133CD0,82133E78,82133F18...
+0x8308B748 = { name = "sub_8308B748" }  # after b; data refs 82133B9C,82133CC4,82133E6C,82133F0C...
+0x8308B750 = { name = "sub_8308B750" }  # after b; data refs 82133F64
+0x8308CAD8 = { name = "sub_8308CAD8" }  # after b; data refs 82133BAC,82133CD4,82133E7C,82133F1C...
+0x8308CAE0 = { name = "sub_8308CAE0" }  # after b; data refs 82133B94,82133CBC,82133E64,82133F04...
+0x8308CAE8 = { name = "sub_8308CAE8" }  # after b; data refs 82133FBC
+0x8308CAF8 = { name = "sub_8308CAF8" }  # after b; data refs 82133BD0,82133CF8,82133EA0,82133F40...
+0x8308CB00 = { name = "sub_8308CB00" }  # after b; data refs 82133B90,82133CB8,82133E60,82133F00...
+0x8308CB08 = { name = "sub_8308CB08" }  # after b; data refs 82133EF8,82133F70
+0x8308CB10 = { name = "sub_8308CB10" }  # after b; data refs 82133FDC
+0x8308DE90 = { name = "sub_8308DE90" }  # after b; data refs 8213407C
+0x8308EBC0 = { name = "sub_8308EBC0" }  # after b; data refs 82134140
+0x83091AA0 = { name = "sub_83091AA0" }  # after b; data refs 8213431C
+0x8309B7F8 = { name = "sub_8309B7F8" }  # after b; data refs 823A0FC8,823A0FD0
+0x8309E3E0 = { name = "sub_8309E3E0" }  # after b; data refs 823A0FE8
+0x8309FB88 = { name = "sub_8309FB88" }  # after b; data refs 82138178,821381D4
+0x8309FB98 = { name = "sub_8309FB98" }  # after b; data refs 821381EC
+0x830A14F0 = { name = "sub_830A14F0" }  # after b; data refs 82138194,821381F0,821382AC
+0x830F0A30 = { name = "sub_830F0A30" }  # after b; data refs 82155910
+0x830F0BF8 = { name = "sub_830F0BF8" }  # after b; data refs 82155918,82155950
+0x830FFAF0 = { name = "sub_830FFAF0" }  # after b; data refs 821587A0
+0x8320E028 = { name = "sub_8320E028" }  # after b; data refs 8217439C
+0x83241BD0 = { name = "sub_83241BD0" }  # after b; data refs 82175B10,821767F8
+0x83257E98 = { name = "sub_83257E98" }  # after b; data refs 82175C30
+0x834152B8 = { name = "sub_834152B8" }  # after b; data refs 82014060
+0x8343B888 = { name = "sub_8343B888" }  # after b; data refs 8222D028
+0x8343E678 = { name = "sub_8343E678" }  # after b; data refs 82228994
+0x836AC270 = { name = "sub_836AC270" }  # after b; data refs 822CFBC8
+0x836E59A8 = { name = "sub_836E59A8" }  # after b; data refs 823A1060
+0x836E5B20 = { name = "sub_836E5B20" }  # after b; data refs 823A1088
+0x836E5E8C = { name = "sub_836E5E8C" }  # after b; data refs 823A10A0
+0x836E5FCC = { name = "sub_836E5FCC" }  # after b; data refs 823A10B8
+0x836E66AC = { name = "sub_836E66AC" }  # after b; data refs 823A10D0
+0x836E84C8 = { name = "sub_836E84C8" }  # after b; data refs 822DF0FC
+0x836E84D0 = { name = "sub_836E84D0" }  # after b; data refs 822DF10C
+0x836E84D8 = { name = "sub_836E84D8" }  # after b; data refs 822DF0F8
+0x836E8738 = { name = "sub_836E8738" }  # after b; data refs 822DF148
+0x836E8740 = { name = "sub_836E8740" }  # after b; data refs 822DF130
+0x836E8748 = { name = "sub_836E8748" }  # after b; data refs 822DF144
+0x836EA430 = { name = "sub_836EA430" }  # after b; data refs 822DF3F8
+0x836EA908 = { name = "sub_836EA908" }  # after b; data refs 822DF4C8
+
+# second scan pass: also bctr boundaries and lis/addi pairs built in code
+0x82479338 = { name = "sub_82479338" }  # after bctr; data refs 83B2B3B4
+0x8247C398 = { name = "sub_8247C398" }  # after bctr; data refs 83B2B450
+0x8247C3D0 = { name = "sub_8247C3D0" }  # after bctr; data refs 83B2B454,83B2B458
+0x8248A150 = { name = "sub_8248A150" }  # after bctr; data refs 823203F4
+0x824AF060 = { name = "sub_824AF060" }  # after bctr; data refs 8203DC48,8204877C,82055A40,820E70C0...
+0x824AF070 = { name = "sub_824AF070" }  # after bctr; data refs 820E70C4,820E70FC,820E7134,820E716C...
+0x824B1718 = { name = "sub_824B1718" }  # after bctr; data refs 82322F5C
+0x824B2008 = { name = "sub_824B2008" }  # after bctr; data refs 82322FC8
+0x824B2058 = { name = "sub_824B2058" }  # after bctr; data refs 82322FC4
+0x824B2190 = { name = "sub_824B2190" }  # after bctr; data refs 82322FB8
+0x824B21E0 = { name = "sub_824B21E0" }  # after bctr; data refs 82322FB4
+0x824B2230 = { name = "sub_824B2230" }  # after bctr; data refs 82322FB0
+0x824BE330 = { name = "sub_824BE330" }  # after bctr; data refs 8233A064
+0x824BEB88 = { name = "sub_824BEB88" }  # after bctr; data refs 82323418
+0x824BEBA0 = { name = "sub_824BEBA0" }  # after bctr; data refs 823233F8
+0x824C1F98 = { name = "sub_824C1F98" }  # after bctr; data refs 82324824
+0x824C8308 = { name = "sub_824C8308" }  # after bctr; data refs 82324888
+0x824DDFD0 = { name = "sub_824DDFD0" }  # after bctr; data refs 82324A3C
+0x824DDFF8 = { name = "sub_824DDFF8" }  # after bctr; data refs 82324A74
+0x824DE050 = { name = "sub_824DE050" }  # after bctr; data refs 82324B48
+0x824DE078 = { name = "sub_824DE078" }  # after bctr; data refs 82324BC8
+0x824DE090 = { name = "sub_824DE090" }  # after bctr; data refs 82E9F448
+0x824DE0A0 = { name = "sub_824DE0A0" }  # after bctr; data refs 82324B1C
+0x824DE0F0 = { name = "sub_824DE0F0" }  # after bctr; data refs 82A634CC,82E9F548
+0x82549668 = { name = "sub_82549668" }  # after bctr; data refs 8233990C
+0x8254BEB0 = { name = "sub_8254BEB0" }  # after bctr; data refs 82339A90
+0x82551DF0 = { name = "sub_82551DF0" }  # after bctr; data refs 8233A078
+0x82551F60 = { name = "sub_82551F60" }  # after bctr; data refs 8254D7EC
+0x82551F70 = { name = "sub_82551F70" }  # after bctr; data refs 8254E1FC
+0x82551F80 = { name = "sub_82551F80" }  # after bctr; data refs 8254F268
+0x82551F90 = { name = "sub_82551F90" }  # after bctr; data refs 8254D0A4
+0x82551FA0 = { name = "sub_82551FA0" }  # after bctr; data refs 8254DCCC
+0x82551FB0 = { name = "sub_82551FB0" }  # after bctr; data refs 8254B7B4
+0x82551FC0 = { name = "sub_82551FC0" }  # after bctr; data refs 8254C800,8254DAF4
+0x82551FD0 = { name = "sub_82551FD0" }  # after bctr; data refs 8254D26C
+0x82551FE0 = { name = "sub_82551FE0" }  # after bctr; data refs 8254E45C
+0x82551FF0 = { name = "sub_82551FF0" }  # after bctr; data refs 82339944
+0x82552008 = { name = "sub_82552008" }  # after bctr; data refs 82339A1C,82339F58
+0x82552020 = { name = "sub_82552020" }  # after bctr; data refs 8254C468,8254C670,8254CDF4
+0x82552030 = { name = "sub_82552030" }  # after bctr; data refs 8254D620
+0x82552040 = { name = "sub_82552040" }  # after bctr; data refs 8254E658,8254E7E0
+0x82559108 = { name = "sub_82559108" }  # after bctr; data refs 8233B6D0
+0x82599908 = { name = "sub_82599908" }  # after bctr; data refs 8233D118
+0x8264DAB0 = { name = "sub_8264DAB0" }  # after bctr; data refs 82381420
+0x82660980 = { name = "sub_82660980" }  # after bctr; data refs 82382ED0
+0x82660E30 = { name = "sub_82660E30" }  # after bctr; data refs 82382EC8
+0x82660E48 = { name = "sub_82660E48" }  # after bctr; data refs 82382EC4,82382ED8
+0x82663148 = { name = "sub_82663148" }  # after bctr; data refs 82382B50,82382BC4
+0x826E60B0 = { name = "sub_826E60B0" }  # after bctr; data refs 8238AD8C
+0x826E60C8 = { name = "sub_826E60C8" }  # after bctr; data refs 8238AD90
+0x8276ACB0 = { name = "sub_8276ACB0" }  # after b; data refs 82821300
+0x82777468 = { name = "sub_82777468" }  # after b; data refs 8276EDC8
+0x8278FDF8 = { name = "sub_8278FDF8" }  # after bctr; data refs 827910F4,82791134
+0x8289B0E8 = { name = "sub_8289B0E8" }  # after bctr; data refs 820140A0
+0x8289B100 = { name = "sub_8289B100" }  # after bctr; data refs 820140A4
+0x8289B118 = { name = "sub_8289B118" }  # after bctr; data refs 820140A8
+0x829DBD88 = { name = "sub_829DBD88" }  # after bctr; data refs 8204879C
+0x82A16C28 = { name = "sub_82A16C28" }  # after bctr; data refs 820566EC,82081C54,820E2588
+0x82A16C38 = { name = "sub_82A16C38" }  # after bctr; data refs 820566FC,82078A8C,82081C64
+0x82BBB2F8 = { name = "sub_82BBB2F8" }  # after bctr; data refs 82088538
+0x82BBB310 = { name = "sub_82BBB310" }  # after bctr; data refs 8208853C
+0x82BBB328 = { name = "sub_82BBB328" }  # after bctr; data refs 82088544
+0x82BBB340 = { name = "sub_82BBB340" }  # after bctr; data refs 82088540
+0x82BBB368 = { name = "sub_82BBB368" }  # after bctr; data refs 8208854C
+0x82BBB380 = { name = "sub_82BBB380" }  # after bctr; data refs 82088554
+0x82BBB398 = { name = "sub_82BBB398" }  # after bctr; data refs 82088558
+0x82BBB3B0 = { name = "sub_82BBB3B0" }  # after bctr; data refs 8208855C
+0x82C538A8 = { name = "sub_82C538A8" }  # after bctr; data refs 820C47E8
+0x82E53018 = { name = "sub_82E53018" }  # after bctr; data refs 820DD2A4,820DD890,8215E0A4,82276250...
+0x82E53028 = { name = "sub_82E53028" }  # after bctr; data refs 820DD2A8,820DD2AC,820DD894,820DD898...
+0x82E54CB8 = { name = "sub_82E54CB8" }  # after bctr; data refs 820DF724
+0x82E54CD8 = { name = "sub_82E54CD8" }  # after bctr; data refs 820DF73C
+0x82E54CF8 = { name = "sub_82E54CF8" }  # after bctr; data refs 820DF744
+0x82E54D18 = { name = "sub_82E54D18" }  # after bctr; data refs 820DF764
+0x82E54F38 = { name = "sub_82E54F38" }  # after bctr; data refs 820DDE80
+0x82E54FD8 = { name = "sub_82E54FD8" }  # after bctr; data refs 820DDE94
+0x82E5AC80 = { name = "sub_82E5AC80" }  # after bctr; data refs 820DE228,820E7DF8
+0x82E5CAF0 = { name = "sub_82E5CAF0" }  # after bctr; data refs 820DDAC8
+0x82E65BE8 = { name = "sub_82E65BE8" }  # after bctr; data refs 820DDDB4
+0x82E6A7D0 = { name = "sub_82E6A7D0" }  # after bctr; data refs 820DFC58
+0x82E6A820 = { name = "sub_82E6A820" }  # after bctr; data refs 820DFC50
+0x82E6A840 = { name = "sub_82E6A840" }  # after bctr; data refs 820DFC4C
+0x82E6A858 = { name = "sub_82E6A858" }  # after bctr; data refs 820DFC40
+0x82E6A870 = { name = "sub_82E6A870" }  # after bctr; data refs 820DFC68
+0x82E6A888 = { name = "sub_82E6A888" }  # after bctr; data refs 820DFC6C
+0x82E6A8B8 = { name = "sub_82E6A8B8" }  # after bctr; data refs 820DFC70
+0x82E6A930 = { name = "sub_82E6A930" }  # after bctr; data refs 820DFC8C
+0x82E6A948 = { name = "sub_82E6A948" }  # after bctr; data refs 820DFC94
+0x82E6A960 = { name = "sub_82E6A960" }  # after bctr; data refs 820DFCC0
+0x82E6A978 = { name = "sub_82E6A978" }  # after bctr; data refs 820DFCC4
+0x82E82A78 = { name = "sub_82E82A78" }  # after bctr; data refs 820DDCE4
+0x82E82A98 = { name = "sub_82E82A98" }  # after bctr; data refs 820DDD0C
+0x82E84848 = { name = "sub_82E84848" }  # after bctr; data refs 820DDDFC,820DDF44,820DE25C
+0x82E84C48 = { name = "sub_82E84C48" }  # after bctr; data refs 820DDDF4,820DDF3C,820DE254
+0x82E91810 = { name = "sub_82E91810" }  # after bctr; data refs 820DEF94
+0x82E92300 = { name = "sub_82E92300" }  # after bctr; data refs 820DF1C0
+0x82E92380 = { name = "sub_82E92380" }  # after bctr; data refs 820DF238
+0x82E92430 = { name = "sub_82E92430" }  # after bctr; data refs 820DF258
+0x82E93EC8 = { name = "sub_82E93EC8" }  # after bctr; data refs 820DF398
+0x82E98128 = { name = "sub_82E98128" }  # after bctr; data refs 820DF750
+0x82E98148 = { name = "sub_82E98148" }  # after bctr; data refs 820DF75C
+0x82E98168 = { name = "sub_82E98168" }  # after bctr; data refs 820DF760
+0x82E98188 = { name = "sub_82E98188" }  # after bctr; data refs 820DF78C
+0x82E981A8 = { name = "sub_82E981A8" }  # after bctr; data refs 820DF790
+0x82E981C8 = { name = "sub_82E981C8" }  # after bctr; data refs 820DF794
+0x82E981E8 = { name = "sub_82E981E8" }  # after bctr; data refs 820DF768
+0x82E98208 = { name = "sub_82E98208" }  # after bctr; data refs 820DF7A4
+0x82E9BB90 = { name = "sub_82E9BB90" }  # after bctr; data refs 820DFC1C
+0x82E9BBA8 = { name = "sub_82E9BBA8" }  # after bctr; data refs 820DFC20
+0x82E9BBC0 = { name = "sub_82E9BBC0" }  # after bctr; data refs 820DFC14
+0x82E9BBD8 = { name = "sub_82E9BBD8" }  # after bctr; data refs 820DFC0C
+0x82E9BBF0 = { name = "sub_82E9BBF0" }  # after bctr; data refs 820DFC18
+0x82E9BC08 = { name = "sub_82E9BC08" }  # after bctr; data refs 820DFC24
+0x82E9BC20 = { name = "sub_82E9BC20" }  # after bctr; data refs 820DFC10
+0x82E9BC38 = { name = "sub_82E9BC38" }  # after bctr; data refs 820DFC28
+0x82E9BC50 = { name = "sub_82E9BC50" }  # after bctr; data refs 820DFC2C
+0x82E9BC68 = { name = "sub_82E9BC68" }  # after bctr; data refs 820DFCE0
+0x82E9BC80 = { name = "sub_82E9BC80" }  # after bctr; data refs 820DFCE4
+0x82E9BC98 = { name = "sub_82E9BC98" }  # after bctr; data refs 820DFCE8
+0x82E9BCB0 = { name = "sub_82E9BCB0" }  # after bctr; data refs 820DFCEC
+0x82E9BCC8 = { name = "sub_82E9BCC8" }  # after bctr; data refs 820DFCB0
+0x82EB3F08 = { name = "sub_82EB3F08" }  # after bctr; data refs 820E41A4
+0x82EB95B0 = { name = "sub_82EB95B0" }  # after bctr; data refs 820E8BA8,820E8BAC
+0x82EBA7D8 = { name = "sub_82EBA7D8" }  # after bctr; data refs 820E4868
+0x82EC0798 = { name = "sub_82EC0798" }  # after bctr; data refs 820E3704
+0x82EC35B8 = { name = "sub_82EC35B8" }  # after bctr; data refs 820E6B5C
+0x82EC7A50 = { name = "sub_82EC7A50" }  # after bctr; data refs 824C3B38,824C3C60,824C3D70,824CF318...
+0x82ECA1D0 = { name = "sub_82ECA1D0" }  # after bctr; data refs 820E65E4
+0x82EE4488 = { name = "sub_82EE4488" }  # after bctr; data refs 820E65C0
+0x82F163C8 = { name = "sub_82F163C8" }  # after bctr; data refs 820EC8E4
+0x82F167F0 = { name = "sub_82F167F0" }  # after bctr; data refs 820EC984
+0x82F169E8 = { name = "sub_82F169E8" }  # after bctr; data refs 820F2408
+0x82F17260 = { name = "sub_82F17260" }  # after bctr; data refs 820EA7A8,820EA7F4
+0x82F22820 = { name = "sub_82F22820" }  # after bctr; data refs 820EBB50
+0x82F23980 = { name = "sub_82F23980" }  # after bctr; data refs 820EBEF4,820EBF08,820EBF3C,820EBF70...
+0x82F239A0 = { name = "sub_82F239A0" }  # after bctr; data refs 820EBEF8,820EBF0C,820EBF40,820EBF74...
+0x82F29200 = { name = "sub_82F29200" }  # after bctr; data refs 820EC8C8
+0x82F29220 = { name = "sub_82F29220" }  # after bctr; data refs 820EC8A0
+0x82F29520 = { name = "sub_82F29520" }  # after bctr; data refs 820EC9B4
+0x82F29540 = { name = "sub_82F29540" }  # after bctr; data refs 820EC988
+0x82F63618 = { name = "sub_82F63618" }  # after bctr; data refs 820F2458
+0x82F63638 = { name = "sub_82F63638" }  # after bctr; data refs 820F2430
+0x82F80848 = { name = "sub_82F80848" }  # after bctr; data refs 8203D51C,8203D54C,820412E8,82041378...
+0x82FE11E0 = { name = "sub_82FE11E0" }  # after bctr; data refs 8210D7F0
+0x830449B4 = { name = "sub_830449B4" }  # after bctr; data refs 8304499C
+0x83046BC4 = { name = "sub_83046BC4" }  # after bctr; data refs 83046BAC
+0x830865E8 = { name = "sub_830865E8" }  # after bctr; data refs 82133B88,82133CB0,82133E58
+0x8308D2D0 = { name = "sub_8308D2D0" }  # after bctr; data refs 821340E4
+0x83095A84 = { name = "sub_83095A84" }  # after bctr; data refs 83095A6C
+0x830B7724 = { name = "sub_830B7724" }  # after bctr; data refs 830B770C
+0x830B7CFC = { name = "sub_830B7CFC" }  # after bctr; data refs 830B7CE4
+0x830BE4E0 = { name = "sub_830BE4E0" }  # after bctr; data refs 830BE4C8
+0x830FE8A0 = { name = "sub_830FE8A0" }  # after bctr; data refs 82158780
+0x8320EAE8 = { name = "sub_8320EAE8" }  # after bctr; data refs 82173814
+0x8323E120 = { name = "sub_8323E120" }  # after bctr; data refs 821757C0
+0x8323FEC0 = { name = "sub_8323FEC0" }  # after bctr; data refs 8217575C
+0x83241768 = { name = "sub_83241768" }  # after bctr; data refs 8217593C
+0x8326EDA0 = { name = "sub_8326EDA0" }  # after bctr; data refs 82187F90
+0x832737E8 = { name = "sub_832737E8" }  # after bctr; data refs 821891FC
+0x8327C328 = { name = "sub_8327C328" }  # after bctr; data refs 821899D0
+0x832A54E0 = { name = "sub_832A54E0" }  # after bctr; data refs 821829B4
+0x833EE3D0 = { name = "sub_833EE3D0" }  # after bctr; data refs 8220F250
+0x8343E9A0 = { name = "sub_8343E9A0" }  # after bctr; data refs 822289B4
+0x8343E9B8 = { name = "sub_8343E9B8" }  # after bctr; data refs 822289B8
+0x8343E9D0 = { name = "sub_8343E9D0" }  # after bctr; data refs 822289BC
+0x83507118 = { name = "sub_83507118" }  # after bctr; data refs 82270034
+0x83507130 = { name = "sub_83507130" }  # after bctr; data refs 82270040
+0x8360DBC8 = { name = "sub_8360DBC8" }  # after bctr; data refs 822BE254
+0x8370B41C = { name = "sub_8370B41C" }  # after bctr; data refs 8370B404
+0x83353818 = { name = "sub_83353818" }  # after the b at 0x83353814 that ends sub_83353790; called through a pointer at the first intermission
+
+# functions right after a tail branch, reached only through pointers (tools/scan_tail_gaps.py:
+# unreachable from the function before and not a jump-table arm). 0x82B2AFC8 crashed season simulate.
+0x82454958 = { name = "sub_82454958" }  # after a tail branch ending sub_82454860
+0x82496B80 = { name = "sub_82496B80" }  # after a tail branch ending sub_82496A48
+0x82497B50 = { name = "sub_82497B50" }  # after a tail branch ending sub_82497A60
+0x825A38B0 = { name = "sub_825A38B0" }  # after a tail branch ending sub_825A37F8
+0x825CF2FC = { name = "sub_825CF2FC" }  # after a tail branch ending sub_825CF2E0
+0x82663C48 = { name = "sub_82663C48" }  # after a tail branch ending sub_82663B58
+0x82676D60 = { name = "sub_82676D60" }  # after a tail branch ending sub_82676C98
+0x82677138 = { name = "sub_82677138" }  # after a tail branch ending sub_82677110
+0x82677298 = { name = "sub_82677298" }  # after a tail branch ending sub_82677268
+0x82677C70 = { name = "sub_82677C70" }  # after a tail branch ending sub_82677BC8
+0x82679D48 = { name = "sub_82679D48" }  # after a tail branch ending sub_82679CF8
+0x8267A6A8 = { name = "sub_8267A6A8" }  # after a tail branch ending sub_8267A660
+0x8267B708 = { name = "sub_8267B708" }  # after a tail branch ending sub_8267B690
+0x8267B8A0 = { name = "sub_8267B8A0" }  # after a tail branch ending sub_8267B874
+0x8267BB88 = { name = "sub_8267BB88" }  # after a tail branch ending sub_8267B9E8
+0x8267BC58 = { name = "sub_8267BC58" }  # after a tail branch ending sub_8267BC2C
+0x8267C6B0 = { name = "sub_8267C6B0" }  # after a tail branch ending sub_8267C670
+0x8267C808 = { name = "sub_8267C808" }  # after a tail branch ending sub_8267C7B8
+0x8267C910 = { name = "sub_8267C910" }  # after a tail branch ending sub_8267C8B8
+0x8267CA80 = { name = "sub_8267CA80" }  # after a tail branch ending sub_8267CA30
+0x8267CC00 = { name = "sub_8267CC00" }  # after a tail branch ending sub_8267CB30
+0x8267CD80 = { name = "sub_8267CD80" }  # after a tail branch ending sub_8267CD30
+0x8267D028 = { name = "sub_8267D028" }  # after a tail branch ending sub_8267CE30
+0x8267D178 = { name = "sub_8267D178" }  # after a tail branch ending sub_8267D128
+0x8267DB20 = { name = "sub_8267DB20" }  # after a tail branch ending sub_8267DA60
+0x8267E068 = { name = "sub_8267E068" }  # after a tail branch ending sub_8267E040
+0x826847B8 = { name = "sub_826847B8" }  # after a tail branch ending sub_82684168
+0x82685300 = { name = "sub_82685300" }  # after a tail branch ending sub_82685220
+0x82688980 = { name = "sub_82688980" }  # after a tail branch ending sub_826888D0
+0x82688C00 = { name = "sub_82688C00" }  # after a tail branch ending sub_82688BD8
+0x827017E4 = { name = "sub_827017E4" }  # after a tail branch ending sub_82701778
+0x82707EB8 = { name = "sub_82707EB8" }  # after a tail branch ending sub_827079F8
+0x8273B828 = { name = "sub_8273B828" }  # after a tail branch ending sub_8273B7A0
+0x8288FFF0 = { name = "sub_8288FFF0" }  # after a tail branch ending sub_8288FD98
+0x82892238 = { name = "sub_82892238" }  # after a tail branch ending sub_82891ED8
+0x82892808 = { name = "sub_82892808" }  # after a tail branch ending sub_828927FC
+0x82893100 = { name = "sub_82893100" }  # after a tail branch ending sub_828930B8
+0x828933F8 = { name = "sub_828933F8" }  # after a tail branch ending sub_828933AC
+0x82893FF0 = { name = "sub_82893FF0" }  # after a tail branch ending sub_82893F98
+0x82894718 = { name = "sub_82894718" }  # after a tail branch ending sub_82894700
+0x82894838 = { name = "sub_82894838" }  # after a tail branch ending sub_828947B8
+0x828949E0 = { name = "sub_828949E0" }  # after a tail branch ending sub_82894980
+0x82894A40 = { name = "sub_82894A40" }  # after a tail branch ending sub_82894A34
+0x828AB1E4 = { name = "sub_828AB1E4" }  # after a tail branch ending sub_828AB1D0
+0x828AB82C = { name = "sub_828AB82C" }  # after a tail branch ending sub_828AB818
+0x828B1214 = { name = "sub_828B1214" }  # after a tail branch ending sub_828B1200
+0x828B2F5C = { name = "sub_828B2F5C" }  # after a tail branch ending sub_828B2F48
+0x828B30B4 = { name = "sub_828B30B4" }  # after a tail branch ending sub_828B30A0
+0x828B31D4 = { name = "sub_828B31D4" }  # after a tail branch ending sub_828B31C0
+0x828B31FC = { name = "sub_828B31FC" }  # after a tail branch ending sub_828B31E8
+0x828B3284 = { name = "sub_828B3284" }  # after a tail branch ending sub_828B3270
+0x828B330C = { name = "sub_828B330C" }  # after a tail branch ending sub_828B32F8
+0x828B336C = { name = "sub_828B336C" }  # after a tail branch ending sub_828B3358
+0x828B3464 = { name = "sub_828B3464" }  # after a tail branch ending sub_828B3450
+0x828B34FC = { name = "sub_828B34FC" }  # after a tail branch ending sub_828B34E8
+0x828B360C = { name = "sub_828B360C" }  # after a tail branch ending sub_828B35F8
+0x828B43FC = { name = "sub_828B43FC" }  # after a tail branch ending sub_828B43E8
+0x828B46A4 = { name = "sub_828B46A4" }  # after a tail branch ending sub_828B4690
+0x828B487C = { name = "sub_828B487C" }  # after a tail branch ending sub_828B4868
+0x828B49CC = { name = "sub_828B49CC" }  # after a tail branch ending sub_828B49B8
+0x828B4ACC = { name = "sub_828B4ACC" }  # after a tail branch ending sub_828B4AB8
+0x828B4B7C = { name = "sub_828B4B7C" }  # after a tail branch ending sub_828B4B68
+0x828B4B94 = { name = "sub_828B4B94" }  # after a tail branch ending sub_828B4B80
+0x828B4C04 = { name = "sub_828B4C04" }  # after a tail branch ending sub_828B4BF0
+0x828B4C2C = { name = "sub_828B4C2C" }  # after a tail branch ending sub_828B4C18
+0x828B4CFC = { name = "sub_828B4CFC" }  # after a tail branch ending sub_828B4CE8
+0x828B4DDC = { name = "sub_828B4DDC" }  # after a tail branch ending sub_828B4DC8
+0x828B4DF4 = { name = "sub_828B4DF4" }  # after a tail branch ending sub_828B4DE0
+0x828B4F94 = { name = "sub_828B4F94" }  # after a tail branch ending sub_828B4F80
+0x829BA53C = { name = "sub_829BA53C" }  # after a tail branch ending sub_829BA4D8
+0x82B2AFC8 = { name = "sub_82B2AFC8" }  # after a tail branch ending sub_82B2AFC0
+0x82BF865C = { name = "sub_82BF865C" }  # after a tail branch ending sub_82BF8648
+0x82BF8714 = { name = "sub_82BF8714" }  # after a tail branch ending sub_82BF8700
+0x82BF8CAC = { name = "sub_82BF8CAC" }  # after a tail branch ending sub_82BF8C98
+0x82BF8EBC = { name = "sub_82BF8EBC" }  # after a tail branch ending sub_82BF8EA8
+0x82BF8EE4 = { name = "sub_82BF8EE4" }  # after a tail branch ending sub_82BF8ED0
+0x82BF9554 = { name = "sub_82BF9554" }  # after a tail branch ending sub_82BF9540
+0x82BF95F4 = { name = "sub_82BF95F4" }  # after a tail branch ending sub_82BF95E0
+0x82BF98E4 = { name = "sub_82BF98E4" }  # after a tail branch ending sub_82BF98D0
+0x82BF9FA4 = { name = "sub_82BF9FA4" }  # after a tail branch ending sub_82BF9F90
+0x82BFA014 = { name = "sub_82BFA014" }  # after a tail branch ending sub_82BFA000
+0x82BFA03C = { name = "sub_82BFA03C" }  # after a tail branch ending sub_82BFA028
+0x82BFA0BC = { name = "sub_82BFA0BC" }  # after a tail branch ending sub_82BFA0A8
+0x82BFA424 = { name = "sub_82BFA424" }  # after a tail branch ending sub_82BFA410
+0x82C086E4 = { name = "sub_82C086E4" }  # after a tail branch ending sub_82C086C0
+0x82C086FC = { name = "sub_82C086FC" }  # after a tail branch ending sub_82C086E8
+0x82C15BF4 = { name = "sub_82C15BF4" }  # after a tail branch ending sub_82C15B50
+0x82C2E284 = { name = "sub_82C2E284" }  # after a tail branch ending sub_82C2E270
+0x82C2E45C = { name = "sub_82C2E45C" }  # after a tail branch ending sub_82C2E448
+0x82C2E554 = { name = "sub_82C2E554" }  # after a tail branch ending sub_82C2E540
+0x82C3C634 = { name = "sub_82C3C634" }  # after a tail branch ending sub_82C3C620
+0x82C3C65C = { name = "sub_82C3C65C" }  # after a tail branch ending sub_82C3C648
+0x82C45834 = { name = "sub_82C45834" }  # after a tail branch ending sub_82C45820
+0x82C45A74 = { name = "sub_82C45A74" }  # after a tail branch ending sub_82C45A60
+0x82C47B04 = { name = "sub_82C47B04" }  # after a tail branch ending sub_82C47AE0
+0x82C48584 = { name = "sub_82C48584" }  # after a tail branch ending sub_82C48570
+0x82C488DC = { name = "sub_82C488DC" }  # after a tail branch ending sub_82C488C8
+0x82C4FB04 = { name = "sub_82C4FB04" }  # after a tail branch ending sub_82C4FAF0
+0x82C4FB2C = { name = "sub_82C4FB2C" }  # after a tail branch ending sub_82C4FB18
+0x82C587A4 = { name = "sub_82C587A4" }  # after a tail branch ending sub_82C58790
+0x82C587FC = { name = "sub_82C587FC" }  # after a tail branch ending sub_82C587E8
+0x82C588AC = { name = "sub_82C588AC" }  # after a tail branch ending sub_82C58898
+0x82C5D75C = { name = "sub_82C5D75C" }  # after a tail branch ending sub_82C5D748
+0x82C5D89C = { name = "sub_82C5D89C" }  # after a tail branch ending sub_82C5D888
+0x82C5DAB4 = { name = "sub_82C5DAB4" }  # after a tail branch ending sub_82C5DAA0
+0x82C5DBB4 = { name = "sub_82C5DBB4" }  # after a tail branch ending sub_82C5DBA0
+0x82C5FA54 = { name = "sub_82C5FA54" }  # after a tail branch ending sub_82C5FA30
+0x82C61A54 = { name = "sub_82C61A54" }  # after a tail branch ending sub_82C61A30
+0x82C6DF1C = { name = "sub_82C6DF1C" }  # after a tail branch ending sub_82C6DF08
+0x82C6DF34 = { name = "sub_82C6DF34" }  # after a tail branch ending sub_82C6DF20
+0x82C7B8EC = { name = "sub_82C7B8EC" }  # after a tail branch ending sub_82C7B8D8
+0x82C7B974 = { name = "sub_82C7B974" }  # after a tail branch ending sub_82C7B960
+0x82C7B9FC = { name = "sub_82C7B9FC" }  # after a tail branch ending sub_82C7B9E8
+0x82C7BA84 = { name = "sub_82C7BA84" }  # after a tail branch ending sub_82C7BA70
+0x82C7BB5C = { name = "sub_82C7BB5C" }  # after a tail branch ending sub_82C7BB48
+0x82C7BC14 = { name = "sub_82C7BC14" }  # after a tail branch ending sub_82C7BC00
+0x82C7BC3C = { name = "sub_82C7BC3C" }  # after a tail branch ending sub_82C7BC28
+0x82C7BC84 = { name = "sub_82C7BC84" }  # after a tail branch ending sub_82C7BC70
+0x82C7BD8C = { name = "sub_82C7BD8C" }  # after a tail branch ending sub_82C7BD78
+0x82C7BE64 = { name = "sub_82C7BE64" }  # after a tail branch ending sub_82C7BE50
+0x82C7C32C = { name = "sub_82C7C32C" }  # after a tail branch ending sub_82C7C318
+0x82C7D32C = { name = "sub_82C7D32C" }  # after a tail branch ending sub_82C7D308
+0x82C7D7BC = { name = "sub_82C7D7BC" }  # after a tail branch ending sub_82C7D798
+0x82C86624 = { name = "sub_82C86624" }  # after a tail branch ending sub_82C86610
+0x82C95344 = { name = "sub_82C95344" }  # after a tail branch ending sub_82C95320
+0x82C98ED4 = { name = "sub_82C98ED4" }  # after a tail branch ending sub_82C98EC0
+0x82C9918C = { name = "sub_82C9918C" }  # after a tail branch ending sub_82C99178
+0x82C9E95C = { name = "sub_82C9E95C" }  # after a tail branch ending sub_82C9E948
+0x82C9EC9C = { name = "sub_82C9EC9C" }  # after a tail branch ending sub_82C9EC88
+0x82CA316C = { name = "sub_82CA316C" }  # after a tail branch ending sub_82CA3158
+0x82CA4554 = { name = "sub_82CA4554" }  # after a tail branch ending sub_82CA4540
+0x82CB9E84 = { name = "sub_82CB9E84" }  # after a tail branch ending sub_82CB9E70
+0x82CB9F1C = { name = "sub_82CB9F1C" }  # after a tail branch ending sub_82CB9F08
+0x82CBA06C = { name = "sub_82CBA06C" }  # after a tail branch ending sub_82CBA058
+0x82CBA1C4 = { name = "sub_82CBA1C4" }  # after a tail branch ending sub_82CBA1B0
+0x82CBAC44 = { name = "sub_82CBAC44" }  # after a tail branch ending sub_82CBAC20
+0x82CBB234 = { name = "sub_82CBB234" }  # after a tail branch ending sub_82CBB210
+0x82CBB904 = { name = "sub_82CBB904" }  # after a tail branch ending sub_82CBB8F0
+0x82CBF28C = { name = "sub_82CBF28C" }  # after a tail branch ending sub_82CBF278
+0x82CBF2A4 = { name = "sub_82CBF2A4" }  # after a tail branch ending sub_82CBF290
+0x82CD5BD4 = { name = "sub_82CD5BD4" }  # after a tail branch ending sub_82CD5BC0
+0x82CD5D4C = { name = "sub_82CD5D4C" }  # after a tail branch ending sub_82CD5D38
+0x82CD6DCC = { name = "sub_82CD6DCC" }  # after a tail branch ending sub_82CD6DB8
+0x82CE0164 = { name = "sub_82CE0164" }  # after a tail branch ending sub_82CE0140
+0x82CE01EC = { name = "sub_82CE01EC" }  # after a tail branch ending sub_82CE01C8
+0x82CE0244 = { name = "sub_82CE0244" }  # after a tail branch ending sub_82CE0220
+0x82CE029C = { name = "sub_82CE029C" }  # after a tail branch ending sub_82CE0278
+0x82CE02F4 = { name = "sub_82CE02F4" }  # after a tail branch ending sub_82CE02D0
+0x82CE050C = { name = "sub_82CE050C" }  # after a tail branch ending sub_82CE04E8
+0x82CE063C = { name = "sub_82CE063C" }  # after a tail branch ending sub_82CE0618
+0x82CE233C = { name = "sub_82CE233C" }  # after a tail branch ending sub_82CE2328
+0x82CE2E14 = { name = "sub_82CE2E14" }  # after a tail branch ending sub_82CE2E00
+0x82CE3284 = { name = "sub_82CE3284" }  # after a tail branch ending sub_82CE3260
+0x82CE331C = { name = "sub_82CE331C" }  # after a tail branch ending sub_82CE32F8
+0x82CF04A4 = { name = "sub_82CF04A4" }  # after a tail branch ending sub_82CF0490
+0x82CF0FDC = { name = "sub_82CF0FDC" }  # after a tail branch ending sub_82CF0FC8
+0x82CF10DC = { name = "sub_82CF10DC" }  # after a tail branch ending sub_82CF10C8
+0x82CF122C = { name = "sub_82CF122C" }  # after a tail branch ending sub_82CF1218
+0x82CF3594 = { name = "sub_82CF3594" }  # after a tail branch ending sub_82CF3580
+0x82CF35AC = { name = "sub_82CF35AC" }  # after a tail branch ending sub_82CF3598
+0x82CF6BEC = { name = "sub_82CF6BEC" }  # after a tail branch ending sub_82CF6BD8
+0x82D00E54 = { name = "sub_82D00E54" }  # after a tail branch ending sub_82D00E40
+0x82D0361C = { name = "sub_82D0361C" }  # after a tail branch ending sub_82D03608
+0x82D04544 = { name = "sub_82D04544" }  # after a tail branch ending sub_82D04530
+0x82D04574 = { name = "sub_82D04574" }  # after a tail branch ending sub_82D04560
+0x82D04764 = { name = "sub_82D04764" }  # after a tail branch ending sub_82D04750
+0x82D0479C = { name = "sub_82D0479C" }  # after a tail branch ending sub_82D04788
+0x82D05AB4 = { name = "sub_82D05AB4" }  # after a tail branch ending sub_82D05AA0
+0x82D05EBC = { name = "sub_82D05EBC" }  # after a tail branch ending sub_82D05EA8
+0x82D086AC = { name = "sub_82D086AC" }  # after a tail branch ending sub_82D08688
+0x82D089C4 = { name = "sub_82D089C4" }  # after a tail branch ending sub_82D089A0
+0x82D09C84 = { name = "sub_82D09C84" }  # after a tail branch ending sub_82D09C70
+0x82D0AB04 = { name = "sub_82D0AB04" }  # after a tail branch ending sub_82D0AAF0
+0x82D0ABD4 = { name = "sub_82D0ABD4" }  # after a tail branch ending sub_82D0ABC0
+0x82D0ACB4 = { name = "sub_82D0ACB4" }  # after a tail branch ending sub_82D0ACA0
+0x82D0AD0C = { name = "sub_82D0AD0C" }  # after a tail branch ending sub_82D0ACF8
+0x82D0AFE4 = { name = "sub_82D0AFE4" }  # after a tail branch ending sub_82D0AFD0
+0x82D0B09C = { name = "sub_82D0B09C" }  # after a tail branch ending sub_82D0B088
+0x82D0B164 = { name = "sub_82D0B164" }  # after a tail branch ending sub_82D0B150
+0x82D0D524 = { name = "sub_82D0D524" }  # after a tail branch ending sub_82D0D500
+0x82D0D91C = { name = "sub_82D0D91C" }  # after a tail branch ending sub_82D0D8F8
+0x82D0E36C = { name = "sub_82D0E36C" }  # after a tail branch ending sub_82D0E358
+0x82D0E484 = { name = "sub_82D0E484" }  # after a tail branch ending sub_82D0E470
+0x82D0E56C = { name = "sub_82D0E56C" }  # after a tail branch ending sub_82D0E558
+0x82D11C04 = { name = "sub_82D11C04" }  # after a tail branch ending sub_82D11BF0
+0x82D11CC4 = { name = "sub_82D11CC4" }  # after a tail branch ending sub_82D11CB0
+0x82D11D6C = { name = "sub_82D11D6C" }  # after a tail branch ending sub_82D11D58
+0x82D11F5C = { name = "sub_82D11F5C" }  # after a tail branch ending sub_82D11F48
+0x82D12034 = { name = "sub_82D12034" }  # after a tail branch ending sub_82D12020
+0x82D12104 = { name = "sub_82D12104" }  # after a tail branch ending sub_82D120F0
+0x82D1252C = { name = "sub_82D1252C" }  # after a tail branch ending sub_82D12518
+0x82D12764 = { name = "sub_82D12764" }  # after a tail branch ending sub_82D12750
+0x82D127DC = { name = "sub_82D127DC" }  # after a tail branch ending sub_82D127C8
+0x82D1284C = { name = "sub_82D1284C" }  # after a tail branch ending sub_82D12838
+0x82D12CDC = { name = "sub_82D12CDC" }  # after a tail branch ending sub_82D12CC8
+0x82D16F6C = { name = "sub_82D16F6C" }  # after a tail branch ending sub_82D16F58
+0x82D17004 = { name = "sub_82D17004" }  # after a tail branch ending sub_82D16FF0
+0x82D17114 = { name = "sub_82D17114" }  # after a tail branch ending sub_82D17100
+0x82D1715C = { name = "sub_82D1715C" }  # after a tail branch ending sub_82D17148
+0x82D17BD4 = { name = "sub_82D17BD4" }  # after a tail branch ending sub_82D17BC0
+0x82D1FDEC = { name = "sub_82D1FDEC" }  # after a tail branch ending sub_82D1FDD8
+0x82D244DC = { name = "sub_82D244DC" }  # after a tail branch ending sub_82D244C8
+0x82D24584 = { name = "sub_82D24584" }  # after a tail branch ending sub_82D24570
+0x82D245CC = { name = "sub_82D245CC" }  # after a tail branch ending sub_82D245B8
+0x82D2BFD4 = { name = "sub_82D2BFD4" }  # after a tail branch ending sub_82D2BFC0
+0x82D2C32C = { name = "sub_82D2C32C" }  # after a tail branch ending sub_82D2C318
+0x82D2C4E4 = { name = "sub_82D2C4E4" }  # after a tail branch ending sub_82D2C4D0
+0x82D2C62C = { name = "sub_82D2C62C" }  # after a tail branch ending sub_82D2C618
+0x82D2C754 = { name = "sub_82D2C754" }  # after a tail branch ending sub_82D2C740
+0x82D31684 = { name = "sub_82D31684" }  # after a tail branch ending sub_82D31670
+0x82D331CC = { name = "sub_82D331CC" }  # after a tail branch ending sub_82D331B8
+0x82D340A4 = { name = "sub_82D340A4" }  # after a tail branch ending sub_82D34090
+0x82D3AA24 = { name = "sub_82D3AA24" }  # after a tail branch ending sub_82D3A9B8
+0x82D420A4 = { name = "sub_82D420A4" }  # after a tail branch ending sub_82D42080
+0x82D427F4 = { name = "sub_82D427F4" }  # after a tail branch ending sub_82D427D0
+0x82DE051C = { name = "sub_82DE051C" }  # after a tail branch ending sub_82DE0508
+0x82DE0664 = { name = "sub_82DE0664" }  # after a tail branch ending sub_82DE0650
+0x82DE0AB4 = { name = "sub_82DE0AB4" }  # after a tail branch ending sub_82DE0AA0
+0x82E461A0 = { name = "sub_82E461A0" }  # after a tail branch ending sub_82E46188
+0x82EB4B68 = { name = "sub_82EB4B68" }  # after a tail branch ending sub_82EB4B50
+0x82EFE230 = { name = "sub_82EFE230" }  # after a tail branch ending sub_82EFDE10
+0x82F84DFC = { name = "sub_82F84DFC" }  # after a tail branch ending sub_82F84DE0
+0x82F84F04 = { name = "sub_82F84F04" }  # after a tail branch ending sub_82F84EE8
+0x830695E8 = { name = "sub_830695E8" }  # after a tail branch ending sub_830693C8
+0x8306C248 = { name = "sub_8306C248" }  # after a tail branch ending sub_8306C240
+0x8306C600 = { name = "sub_8306C600" }  # after a tail branch ending sub_8306C5A8
+0x8306CD64 = { name = "sub_8306CD64" }  # after a tail branch ending sub_8306CCD0
+0x8306CFFC = { name = "sub_8306CFFC" }  # after a tail branch ending sub_8306CF68
+0x8306DA60 = { name = "sub_8306DA60" }  # after a tail branch ending sub_8306D9C0
+0x8306DDD0 = { name = "sub_8306DDD0" }  # after a tail branch ending sub_8306DB68
+0x8306DEC8 = { name = "sub_8306DEC8" }  # after a tail branch ending sub_8306DE8C
+0x8306F100 = { name = "sub_8306F100" }  # after a tail branch ending sub_8306F0F0
+0x8306FFE8 = { name = "sub_8306FFE8" }  # after a tail branch ending sub_8306FD58
+0x830703C8 = { name = "sub_830703C8" }  # after a tail branch ending sub_830701A8
+0x83070578 = { name = "sub_83070578" }  # after a tail branch ending sub_830704B0
+0x83070EF0 = { name = "sub_83070EF0" }  # after a tail branch ending sub_83070ED0
+0x83071DB0 = { name = "sub_83071DB0" }  # after a tail branch ending sub_83071C08
+0x83071E88 = { name = "sub_83071E88" }  # after a tail branch ending sub_83071E4C
+0x830725A8 = { name = "sub_830725A8" }  # after a tail branch ending sub_83072560
+0x83072D70 = { name = "sub_83072D70" }  # after a tail branch ending sub_83072D4C
+0x83072E00 = { name = "sub_83072E00" }  # after a tail branch ending sub_83072DD4
+0x83073100 = { name = "sub_83073100" }  # after a tail branch ending sub_83073088
+0x830732E0 = { name = "sub_830732E0" }  # after a tail branch ending sub_8307327C
+0x83073608 = { name = "sub_83073608" }  # after a tail branch ending sub_83073600
+0x830736E0 = { name = "sub_830736E0" }  # after a tail branch ending sub_83073674
+0x83073810 = { name = "sub_83073810" }  # after a tail branch ending sub_830737A4
+0x83073DE0 = { name = "sub_83073DE0" }  # after a tail branch ending sub_83073DD0
+0x83074230 = { name = "sub_83074230" }  # after a tail branch ending sub_83074228
+0x83074FD0 = { name = "sub_83074FD0" }  # after a tail branch ending sub_830749B8
+0x830753C0 = { name = "sub_830753C0" }  # after a tail branch ending sub_83075180
+0x83075628 = { name = "sub_83075628" }  # after a tail branch ending sub_83075548
+0x83075790 = { name = "sub_83075790" }  # after a tail branch ending sub_83075758
+0x830758B0 = { name = "sub_830758B0" }  # after a tail branch ending sub_83075898
+0x8307A9F8 = { name = "sub_8307A9F8" }  # after a tail branch ending sub_8307A7B8
+0x8307BCC0 = { name = "sub_8307BCC0" }  # after a tail branch ending sub_8307BC08
+0x8307C9B8 = { name = "sub_8307C9B8" }  # after a tail branch ending sub_8307C9A4
+0x8307CAB8 = { name = "sub_8307CAB8" }  # after a tail branch ending sub_8307CAA8
+0x8307D400 = { name = "sub_8307D400" }  # after a tail branch ending sub_8307D348
+0x8307D530 = { name = "sub_8307D530" }  # after a tail branch ending sub_8307D508
+0x8307E2A8 = { name = "sub_8307E2A8" }  # after a tail branch ending sub_8307E1F0
+0x8307E5E8 = { name = "sub_8307E5E8" }  # after a tail branch ending sub_8307E520
+0x8307E9B8 = { name = "sub_8307E9B8" }  # after a tail branch ending sub_8307E9B0
+0x83080F90 = { name = "sub_83080F90" }  # after a tail branch ending sub_83080F20
+0x83081190 = { name = "sub_83081190" }  # after a tail branch ending sub_83081170
+0x83081B98 = { name = "sub_83081B98" }  # after a tail branch ending sub_83081B48
+0x8309B7B0 = { name = "sub_8309B7B0" }  # after a tail branch ending sub_8309B4A0
+0x8309E3A0 = { name = "sub_8309E3A0" }  # after a tail branch ending sub_8309E348
+0x830E2A14 = { name = "sub_830E2A14" }  # after a tail branch ending sub_830E2A00
+0x830E33F4 = { name = "sub_830E33F4" }  # after a tail branch ending sub_830E33E0
+0x830E3604 = { name = "sub_830E3604" }  # after a tail branch ending sub_830E35F0
+0x830E36BC = { name = "sub_830E36BC" }  # after a tail branch ending sub_830E36A8
+0x830F179C = { name = "sub_830F179C" }  # after a tail branch ending sub_830F16F0
+0x8321E61C = { name = "sub_8321E61C" }  # after a tail branch ending sub_8321E608
+0x8321F954 = { name = "sub_8321F954" }  # after a tail branch ending sub_8321F940
+0x832201AC = { name = "sub_832201AC" }  # after a tail branch ending sub_83220198
+0x83220234 = { name = "sub_83220234" }  # after a tail branch ending sub_83220220
+0x8322024C = { name = "sub_8322024C" }  # after a tail branch ending sub_83220238
+0x832203CC = { name = "sub_832203CC" }  # after a tail branch ending sub_832203B8
+0x83223E84 = { name = "sub_83223E84" }  # after a tail branch ending sub_83223E70
+0x832452C8 = { name = "sub_832452C8" }  # after a tail branch ending sub_83245228
+0x832B094C = { name = "sub_832B094C" }  # after a tail branch ending sub_832B0930
+0x83300E8C = { name = "sub_83300E8C" }  # after a tail branch ending sub_83300E70
+0x833CB2F8 = { name = "sub_833CB2F8" }  # after a tail branch ending sub_833CB2C0
+0x834D0110 = { name = "sub_834D0110" }  # after a tail branch ending sub_834D00F8
+0x836BC264 = { name = "sub_836BC264" }  # after a tail branch ending sub_836BC250
+0x836BC33C = { name = "sub_836BC33C" }  # after a tail branch ending sub_836BC328
+0x836BC494 = { name = "sub_836BC494" }  # after a tail branch ending sub_836BC480
+0x836BC504 = { name = "sub_836BC504" }  # after a tail branch ending sub_836BC4F0
+0x836D6528 = { name = "sub_836D6528" }  # after a tail branch ending sub_836D6518
+0x836E49F0 = { name = "sub_836E49F0" }  # after a tail branch ending sub_836E4978
+0x836E5318 = { name = "sub_836E5318" }  # after a tail branch ending sub_836E52D8
+0x836E54F0 = { name = "sub_836E54F0" }  # after a tail branch ending sub_836E54B8
+0x836E5880 = { name = "sub_836E5880" }  # after a tail branch ending sub_836E57F8
+0x836E5AA8 = { name = "sub_836E5AA8" }  # after a tail branch ending sub_836E5A68
+0x836E5C20 = { name = "sub_836E5C20" }  # after a tail branch ending sub_836E5B58
+0x836E5EB0 = { name = "sub_836E5EB0" }  # after a tail branch ending sub_836E5EA4
+0x836ED94C = { name = "sub_836ED94C" }  # after a tail branch ending sub_836ED938
+0x836F0144 = { name = "sub_836F0144" }  # after a tail branch ending sub_836F0120
+0x839138E0 = { name = "sub_839138E0" }  # after a tail branch ending sub_839138D0

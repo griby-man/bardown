@@ -1,0 +1,18 @@
+#!/bin/sh
+# the program, its runtime and the GPU plugin sit together in usr/bin; it finds the game, and keeps its
+# settings, saves and cache, beside the AppImage itself
+here="$(dirname "$(readlink -f "$0")")"
+# a build for older distros carries a newer C++ runtime than theirs. it's used only when the system's is
+# older: graphics drivers link the system's, and a newer system's has to win
+compat="$here/usr/lib/compat"
+if [ -f "$compat/libstdc++.so.6" ]; then
+  newest() { grep -ao 'GLIBCXX_3\.4\.[0-9]*' "$1" 2>/dev/null | sort -uV | tail -1; }
+  system=$(ldconfig -p 2>/dev/null | grep 'libstdc++\.so\.6 .*x86-64' | head -1 | sed 's/.*=> //')
+  ours=$(newest "$compat/libstdc++.so.6")
+  theirs=$( [ -n "$system" ] && newest "$system")
+  if [ -z "$theirs" ] || [ "$(printf '%s\n%s\n' "$theirs" "$ours" | sort -V | tail -1)" != "$theirs" ]; then
+    LD_LIBRARY_PATH="$compat${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export LD_LIBRARY_PATH
+  fi
+fi
+exec "$here/usr/bin/bardown" "$@"

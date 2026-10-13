@@ -1,0 +1,6 @@
+[submodule "third_party/rexglue-sdk"]
+	path = third_party/rexglue-sdk
+	url = https://github.com/rexglue/rexglue-sdk.git
+[submodule "third_party/XenosRecomp"]
+	path = third_party/XenosRecomp
+	url = https://github.com/hedge-dev/XenosRecomp.git

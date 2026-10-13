@@ -1,0 +1,1280 @@
+diff --git a/cmake/rexglue_install.cmake b/cmake/rexglue_install.cmake
+index d9a64eb..352de37 100644
+--- a/cmake/rexglue_install.cmake
++++ b/cmake/rexglue_install.cmake
+@@ -22,6 +22,7 @@ set(REXGLUE_INSTALL_TARGETS
+ 
+ if(REXGLUE_USE_VULKAN)
+     list(APPEND REXGLUE_INSTALL_TARGETS
++        rexgpu-native
+         SPIRV glslang MachineIndependent GenericCodeGen OSDependent OGLCompiler  # glslang
+         spirv-tools-headers
+     )
+diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
+index da8e432..79e0994 100644
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -44,6 +44,8 @@ enum class ReadbackResolveMode {
+   kFast,
+   kSome,
+   kFull,
++  // per-frame resolves delayed a frame, one-off resolves (render-to-texture done once at load) synced
++  kAuto,
+ };
+ 
+ struct SwapState {
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 696ff48..d9f486a 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -452,6 +452,7 @@ class VulkanCommandProcessor : public CommandProcessor {
+     uint32_t written_size[2] = {0, 0};
+     uint32_t current_index = 0;
+     uint64_t last_used_frame = 0;
++    uint32_t streak = 0;  // frames in a row it's been resolved
+   };
+   void EvictOldReadbackBuffers(std::unordered_map<uint64_t, ReadbackBuffer>& buffer_map);
+   static constexpr uint32_t kReadbackBufferSizeIncrement = 16 * 1024 * 1024;
+diff --git a/include/rex/input/input_system.h b/include/rex/input/input_system.h
+index 1cb3faa..a150134 100644
+--- a/include/rex/input/input_system.h
++++ b/include/rex/input/input_system.h
+@@ -1,4 +1,6 @@
+ #pragma once
++
++#include <mutex>
+ /**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+@@ -64,6 +66,8 @@ class InputSystem : public system::IInputSystem {
+   // Ordered by ordinal. Ordinals are never recycled, so unplugging pad one
+   // does not renumber pad two.
+   std::vector<DeviceInfo> devices_;
++  // games poll input from several threads, and every entry point re-enumerates devices
++  std::recursive_mutex mutex_;
+   std::vector<InputDriver*> device_owners_;
+ };
+ 
+diff --git a/include/rex/ui/external_output.h b/include/rex/ui/external_output.h
+new file mode 100644
+index 0000000..a5e046a
+--- /dev/null
++++ b/include/rex/ui/external_output.h
+@@ -0,0 +1,25 @@
++#pragma once
++
++#include <chrono>
++#include <cstdint>
++#include <functional>
++
++#include <rex/ui/presenter.h>
++
++namespace rex::ui {
++
++// lets a renderer outside the gpu emulation own the picture: while set, the emulation's swaps no longer
++// refresh the guest output, and the outside renderer refreshes it through RefreshGuestOutputExternal
++void SetGuestOutputExternal(bool external);
++bool RefreshGuestOutputExternal(Presenter& presenter, uint32_t frontbuffer_width,
++                                uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
++                                uint32_t display_aspect_ratio_y,
++                                std::function<bool(Presenter::GuestOutputRefreshContext& context)> refresher);
++
++// the outside renderer has taken a frame's data (called at each of its swaps). a gpu front end that draws
++// nothing holds each swap until then, so fences after it don't tell the game the frame is done before it was
++// read, as the 360's GPU, a frame behind, never did. returns false if the wait ran out
++void ExternalFrameDone();
++bool WaitExternalFrame(std::chrono::milliseconds limit);
++
++}  // namespace rex::ui
+diff --git a/src/codegen/builders/vector.cpp b/src/codegen/builders/vector.cpp
+index cbdd7f7..869afd2 100644
+--- a/src/codegen/builders/vector.cpp
++++ b/src/codegen/builders/vector.cpp
+@@ -1098,14 +1098,18 @@ bool build_vpkuhus(BuilderContext& ctx) {
+   // NOTE(tomc): _mm_packus_epi16 treats inputs as signed, so we need custom saturation for
+   // unsigned. Unsigned halfwords >= 0x8000 would be interpreted as negative and clamped to 0
+   // instead of 0xFF.
++  // build in v_temp: vD usually aliases vA or vB, and the narrower writes would clobber
++  // source halfwords before they are read
+   for (size_t i = 0; i < 8; i++) {
+     ctx.println("\t{}.u8[{}] = {}.u16[{}] > 0xFF ? 0xFF : (uint8_t){}.u16[{}];",
+-                ctx.v(ctx.insn.operands[0]), 15 - i, ctx.v(ctx.insn.operands[1]), 7 - i,
++                ctx.v_temp(), 15 - i, ctx.v(ctx.insn.operands[1]), 7 - i,
+                 ctx.v(ctx.insn.operands[1]), 7 - i);
+     ctx.println("\t{}.u8[{}] = {}.u16[{}] > 0xFF ? 0xFF : (uint8_t){}.u16[{}];",
+-                ctx.v(ctx.insn.operands[0]), 7 - i, ctx.v(ctx.insn.operands[2]), 7 - i,
++                ctx.v_temp(), 7 - i, ctx.v(ctx.insn.operands[2]), 7 - i,
+                 ctx.v(ctx.insn.operands[2]), 7 - i);
+   }
++  ctx.println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_load_si128((simde__m128i*){}.u8));",
++              ctx.v(ctx.insn.operands[0]), ctx.v_temp());
+   return true;
+ }
+ 
+@@ -1126,14 +1130,17 @@ bool build_vpkuwus(BuilderContext& ctx) {
+ 
+   // NOTE(tomc): _mm_packus_epi32 treats inputs as signed, so we need custom saturation for unsigned
+   // Saturate each u32 to [0, 0xFFFF], then pack to u16
++  // same aliasing hazard as vpkuhus, so build in v_temp
+   for (size_t i = 0; i < 4; i++) {
+     ctx.println("\t{}.u16[{}] = {}.u32[{}] > 0xFFFF ? 0xFFFF : (uint16_t){}.u32[{}];",
+-                ctx.v(ctx.insn.operands[0]), 7 - i, ctx.v(ctx.insn.operands[1]), 3 - i,
++                ctx.v_temp(), 7 - i, ctx.v(ctx.insn.operands[1]), 3 - i,
+                 ctx.v(ctx.insn.operands[1]), 3 - i);
+     ctx.println("\t{}.u16[{}] = {}.u32[{}] > 0xFFFF ? 0xFFFF : (uint16_t){}.u32[{}];",
+-                ctx.v(ctx.insn.operands[0]), 3 - i, ctx.v(ctx.insn.operands[2]), 3 - i,
++                ctx.v_temp(), 3 - i, ctx.v(ctx.insn.operands[2]), 3 - i,
+                 ctx.v(ctx.insn.operands[2]), 3 - i);
+   }
++  ctx.println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_load_si128((simde__m128i*){}.u8));",
++              ctx.v(ctx.insn.operands[0]), ctx.v_temp());
+   return true;
+ }
+ 
+diff --git a/src/core/memory_posix.cpp b/src/core/memory_posix.cpp
+index b52bf39..6500cb5 100644
+--- a/src/core/memory_posix.cpp
++++ b/src/core/memory_posix.cpp
+@@ -483,6 +483,9 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
+     shm_unlink(full_path.c_str());
+     return kFileMappingHandleInvalid;
+   }
++  // nothing reopens it by name, only through this fd. unlinking now means a hard exit or a
++  // crash can't leave a multi-GB file behind in /dev/shm (which is RAM)
++  shm_unlink(full_path.c_str());
+   return static_cast<FileMappingHandle>(ret);
+ #endif
+ }
+diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
+index 0d8f8af..da5cfec 100644
+--- a/src/graphics/CMakeLists.txt
++++ b/src/graphics/CMakeLists.txt
+@@ -158,3 +158,30 @@ if(REXGLUE_USE_D3D12)
+         dxguid
+     )
+ endif()
++
++# rexgpu-native: no GPU emulation. the command stream's mechanics (fences, interrupts, swaps) for a program
++# that draws natively from its own hooks; the window and Vulkan device come from the runtime
++if(REXGLUE_USE_VULKAN)
++    add_library(rexgpu-native SHARED
++        native/plugin_main.cpp
++        flags.cpp
++        register_file.cpp
++        registers.cpp
++        pipeline/shader/shader.cpp
++        format/ucode.cpp
++        graphics_system.cpp
++        command_processor.cpp
++    )
++    set_target_properties(rexgpu-native PROPERTIES
++        EXPORT_NAME gpu-native
++        CXX_VISIBILITY_PRESET hidden
++        VISIBILITY_INLINES_HIDDEN ON
++    )
++    target_include_directories(rexgpu-native PRIVATE ${REXGLUE_ROOT}/thirdparty/renderdoc)
++    target_compile_options(rexgpu-native PRIVATE -Wno-unused-variable)
++    target_link_libraries(rexgpu-native PRIVATE
++        rexruntime
++        xxHash::xxhash
++        Vulkan::Headers
++    )
++endif()
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index a744375..a16204d 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -10,7 +10,12 @@
+  */
+ 
+ #include <algorithm>
++#include <cstdlib>
++#include <unordered_map>
++#include <mutex>
+ #include <cinttypes>
++#include <vector>
++#include <string>
+ #include <cmath>
+ #include <cstring>
+ #include <string_view>
+@@ -36,6 +41,8 @@
+ #include <rex/system/user_module.h>
+ 
+ REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
++REXCVAR_DEFINE_BOOL(gpu_wait_spin, false, "GPU",
++                    "Spin instead of sleeping on WAIT_REG_MEM (keeps 60 Hz vblank, unlike vsync=false)");
+ 
+ REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
+                     "Refresh page-valid state from GPU-written memory at frame end. "
+@@ -50,8 +57,9 @@ REXCVAR_DEFINE_STRING(readback_resolve, "none", "GPU",
+                       " none: Disable readback (default)\n"
+                       " fast: Read previous frame (delayed, copy every frame)\n"
+                       " some: Read previous frame (delayed, copy on cache miss)\n"
+-                      " full: Immediate sync readback (accurate but stalls)")
+-    .allowed({"none", "fast", "some", "full"})
++                      " full: Immediate sync readback (accurate but stalls)\n"
++                      " auto: Delay resolves repeated every frame, sync one-off ones")
++    .allowed({"none", "fast", "some", "full", "auto"})
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
+ REXCVAR_DEFINE_BOOL(readback_resolve_half_pixel_offset, false, "GPU",
+@@ -96,6 +104,9 @@ ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
+   if (value == "full") {
+     return ReadbackResolveMode::kFull;
+   }
++  if (value == "auto") {
++    return ReadbackResolveMode::kAuto;
++  }
+   return ReadbackResolveMode::kDisabled;
+ }
+ 
+@@ -668,7 +679,6 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
+   if (packet == 0) {
+     return true;
+   }
+-
+   if (packet == 0xCDCDCDCD) {
+     REXGPU_WARN("GPU packet is CDCDCDCD - probably read uninitialized memory!");
+   }
+@@ -1033,7 +1043,8 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+       // Wait.
+       if (wait >= 0x100) {
+         PrepareForWait();
+-        if (!REXCVAR_GET(vsync)) {
++        // host sleeps round up past a millisecond, which adds up over several waits a frame
++        if (!REXCVAR_GET(vsync) || REXCVAR_GET(gpu_wait_spin)) {
+           // User wants it fast and dangerous.
+           rex::thread::MaybeYield();
+         } else {
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index 8f2fcb0..cac2daa 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -9,6 +9,8 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <cstdlib>
++#include <chrono>
+ #include <rex/graphics/graphics_system.h>
+ 
+ #include <algorithm>
+@@ -162,9 +164,39 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+           uint64_t interval_ticks =
+               REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
++          uint32_t fired = 0;
++          static double slowest_ms = 0;
+           while (current_time - last_frame_time >= interval_ticks) {
++            auto t0 = std::chrono::steady_clock::now();
+             MarkVblank();
++            slowest_ms = std::max(
++                slowest_ms,
++                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
++                    .count());
+             last_frame_time += interval_ticks;
++            ++fired;
++          }
++          // REX_LOG_FPS=1: report vblanks that had to be fired back to back to catch up
++          static const bool log_vblank = [] {
++            const char* v = std::getenv("REX_LOG_FPS");
++            return v && *v && *v != '0';
++          }();
++          if (log_vblank) {
++            using clock = std::chrono::steady_clock;
++            static clock::time_point window = clock::now();
++            static uint32_t bursts = 0, max_burst = 0, total = 0;
++            total += fired;
++            if (fired > 1) {
++              ++bursts;
++              max_burst = std::max(max_burst, fired);
++            }
++            if (clock::now() - window >= std::chrono::seconds(1)) {
++              REXGPU_INFO("[vblank] {} fired/s, {} catch-up bursts, largest {}, slowest handler {:.1f} ms",
++                          total, bursts, max_burst, slowest_ms);
++              window = clock::now();
++              bursts = max_burst = total = 0;
++              slowest_ms = 0;
++            }
+           }
+           rex::thread::Sleep(std::chrono::milliseconds(1));
+         }
+diff --git a/src/graphics/native/plugin_main.cpp b/src/graphics/native/plugin_main.cpp
+new file mode 100644
+index 0000000..94b3aac
+--- /dev/null
++++ b/src/graphics/native/plugin_main.cpp
+@@ -0,0 +1,87 @@
++/**
++ * @file        graphics/native/plugin_main.cpp
++ * @brief       rexgpu-native: no GPU emulation, for a program that draws natively from its own hooks
++ *
++ * @license     BSD 3-Clause License
++ *              See LICENSE file in the project root for full license text.
++ *
++ * @remarks     keeps the command stream's mechanics (fences, waits, indirect buffers, interrupts, the swap
++ *              count) and draws nothing. the window and the Vulkan device come from the runtime's provider
++ */
++
++#include <chrono>
++#include <memory>
++#include <string_view>
++#include <unordered_map>
++
++#include <xxhash.h>
++
++#include <rex/graphics/command_processor.h>
++#include <rex/graphics/graphics_system.h>
++#include <rex/graphics/pipeline/shader/shader.h>
++#include <rex/logging.h>
++#include <rex/system/gpu_plugin.h>
++#include <rex/system/kernel_state.h>
++#include <rex/ui/external_output.h>
++#include <rex/ui/vulkan/provider.h>
++
++namespace rex::graphics::native {
++namespace {
++
++class NullCommandProcessor : public CommandProcessor {
++ public:
++  using CommandProcessor::CommandProcessor;
++
++ protected:
++  bool SetupContext() override { return true; }
++  void ShutdownContext() override { shaders_.clear(); }
++  // the frame is the program's: the stream goes on once it's been shown
++  void IssueSwap(uint32_t, uint32_t, uint32_t) override {
++    rex::ui::WaitExternalFrame(std::chrono::milliseconds(100));
++  }
++  Shader* LoadShader(xenos::ShaderType shader_type, uint32_t, const uint32_t* host_address,
++                     uint32_t dword_count) override {
++    const uint64_t hash = XXH3_64bits(host_address, dword_count * sizeof(uint32_t));
++    auto& shader = shaders_[hash ^ uint64_t(shader_type)];
++    if (!shader) shader = std::make_unique<Shader>(shader_type, hash, host_address, dword_count);
++    return shader.get();
++  }
++  bool IssueDraw(xenos::PrimitiveType, uint32_t, IndexBufferInfo*, bool) override { return true; }
++  bool IssueCopy() override { return true; }
++
++ private:
++  std::unordered_map<uint64_t, std::unique_ptr<Shader>> shaders_;
++};
++
++class NativeGraphicsSystem : public GraphicsSystem {
++ public:
++  std::string name() const override { return "native"; }
++
++ protected:
++  void CreateProvider(bool with_presentation) override {
++    provider_ = rex::ui::vulkan::VulkanProvider::Create(true, with_presentation);
++  }
++
++ private:
++  std::unique_ptr<CommandProcessor> CreateCommandProcessor() override {
++    return std::make_unique<NullCommandProcessor>(this, kernel_state_);
++  }
++};
++
++}  // namespace
++}  // namespace rex::graphics::native
++
++extern "C" REX_GPU_PLUGIN_EXPORT uint32_t rex_gpu_abi_version(void) {
++  return rex::system::kGpuPluginAbiVersion;
++}
++
++extern "C" REX_GPU_PLUGIN_EXPORT rex::system::IGraphicsSystem* rex_gpu_create(
++    uint32_t abi_version, const rex::system::GpuCreateInfo* info) {
++  if (abi_version != rex::system::kGpuPluginAbiVersion || !info ||
++      info->struct_size < sizeof(rex::system::GpuCreateInfo)) {
++    REXLOG_ERROR("rexgpu-native: ABI {} or create info doesn't match (plugin is ABI {})", abi_version,
++                 rex::system::kGpuPluginAbiVersion);
++    return nullptr;
++  }
++  return new rex::graphics::native::NativeGraphicsSystem();
++}
+diff --git a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+index 9ce3bb4..9a47865 100644
+--- a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+@@ -2030,10 +2030,23 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
+         }
+ 
+         // Apply the exponent bias from the bits 13:18 of the fetch constant
+-        // word 4.
++        // word 3 (exp_adjust). word 4 bits 12:21 are the lod bias, reading the
++        // bias from there scaled every sample by a power of two of lod bias bits.
++        id_vector_temp_.clear();
++        id_vector_temp_.push_back(const_int_0_);
++        id_vector_temp_.push_back(
++            builder_->makeIntConstant(int((fetch_constant_word_0_index + 3) >> 2)));
++        id_vector_temp_.push_back(
++            builder_->makeIntConstant(int((fetch_constant_word_0_index + 3) & 3)));
++        spv::Id fetch_constant_word_3_signed = builder_->createUnaryOp(
++            spv::OpBitcast, type_int_,
++            builder_->createLoad(
++                builder_->createAccessChain(spv::StorageClassUniform, uniform_fetch_constants_,
++                                            id_vector_temp_),
++                spv::NoPrecision));
+         spv::Id result_exponent_bias = builder_->createBinBuiltinCall(
+             type_float_, ext_inst_glsl_std_450_, GLSLstd450Ldexp, const_float_1_,
+-            builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_4_signed,
++            builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_3_signed,
+                                   builder_->makeUintConstant(13), builder_->makeUintConstant(6)));
+         {
+           uint32_t result_remaining_components = used_result_nonzero_components;
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+index 76f5600..12388b4 100644
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -9,7 +9,11 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <set>
++#include <mutex>
++#include <cstdlib>
+ #include <algorithm>
++#include <unordered_set>
+ #include <cstdint>
+ #include <utility>
+ 
+@@ -495,6 +499,28 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
+     uint8_t old_swizzled_signs = binding.swizzled_signs;
+     BindingInfoFromFetchConstant(fetch, binding.key, &binding.swizzled_signs);
+     texture_bindings_in_sync_ |= index_bit;
++    {
++      // REX_LOG_RT_FORMATS=1 also logs each distinct texture fetch layout once
++      static const bool log_formats = [] {
++        const char* v = std::getenv("REX_LOG_RT_FORMATS");
++        return v && *v && *v != '0';
++      }();
++      if (log_formats) {
++        static std::mutex mutex;
++        static std::set<uint64_t> seen;
++        uint32_t signs = uint32_t(fetch.sign_x) | uint32_t(fetch.sign_y) << 2 |
++                         uint32_t(fetch.sign_z) << 4 | uint32_t(fetch.sign_w) << 6;
++        uint64_t key = uint64_t(fetch.type) | uint64_t(fetch.format) << 2 | uint64_t(signs) << 8 |
++                       uint64_t(fetch.num_format) << 16 | uint64_t(uint8_t(fetch.exp_adjust)) << 17 |
++                       uint64_t(fetch.dimension) << 25 | uint64_t(binding.key.is_valid) << 27;
++        std::lock_guard lock(mutex);
++        if (seen.insert(key).second) {
++          REXGPU_INFO("[tex-formats] type={} format={} signs={:08b} num_format={} exp_adjust={} dim={} valid={}",
++                      uint32_t(fetch.type), uint32_t(fetch.format), signs, uint32_t(fetch.num_format),
++                      int32_t(fetch.exp_adjust), uint32_t(fetch.dimension), bool(binding.key.is_valid));
++        }
++      }
++    }
+     if (!binding.key.is_valid) {
+       if (old_key.is_valid) {
+         bindings_changed |= index_bit;
+@@ -914,6 +940,17 @@ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetc
+       if (REXCVAR_GET(gpu_allow_invalid_fetch_constants)) {
+         break;
+       }
++      // some games hit the same few invalid constants every draw; warning each time wrote thousands of
++      // lines a second from the GPU thread, which stalled frames, so each one is reported once
++      {
++        static std::mutex seen_mutex;
++        static std::unordered_set<uint64_t> seen;
++        const uint64_t id = (uint64_t(fetch.dword_0) << 32 | fetch.dword_1) ^
++                            (uint64_t(fetch.dword_2) << 21) ^ (uint64_t(fetch.dword_3) << 42) ^
++                            (uint64_t(fetch.dword_4) << 11) ^ fetch.dword_5;
++        std::lock_guard lock(seen_mutex);
++        if (!seen.insert(id).second) return;
++      }
+       REXGPU_WARN(
+           "Texture fetch constant ({:08X} {:08X} {:08X} {:08X} {:08X} {:08X}) "
+           "has \"invalid\" type! This is incorrect behavior, but you can try "
+diff --git a/src/graphics/util/draw.cpp b/src/graphics/util/draw.cpp
+index 305380e..689dad0 100644
+--- a/src/graphics/util/draw.cpp
++++ b/src/graphics/util/draw.cpp
+@@ -9,6 +9,9 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <set>
++#include <mutex>
++#include <cstdlib>
+ #include <algorithm>
+ #include <cmath>
+ 
+@@ -1081,6 +1084,26 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
+   }
+   info_out.color_edram_info = color_edram_info;
+ 
++  // REX_LOG_RT_FORMATS=1: log each distinct resolve (src format, dest format, exp bias) once
++  if (!is_depth) {
++    static const bool log_formats = [] {
++      const char* v = std::getenv("REX_LOG_RT_FORMATS");
++      return v && *v && *v != '0';
++    }();
++    if (log_formats) {
++      static std::mutex mutex;
++      static std::set<uint64_t> seen;
++      uint64_t key = (uint64_t(color_edram_info.format) << 32) | (uint64_t(dest_format) << 8) |
++                     uint64_t(uint8_t(rb_copy_dest_info.copy_dest_exp_bias));
++      std::lock_guard lock(mutex);
++      if (seen.insert(key).second) {
++        REXGPU_INFO("[rt-formats] resolve src_rt_format={} dest_format={} dest_exp_bias={} final_exp_bias={}",
++                    uint32_t(color_edram_info.format), uint32_t(dest_format),
++                    int32_t(rb_copy_dest_info.copy_dest_exp_bias), exp_bias);
++      }
++    }
++  }
++
+   // Patch and write RB_COPY_DEST_INFO.
+   info_out.copy_dest_info = rb_copy_dest_info;
+   // Override with the depth format to make sure the shader doesn't have any
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 001f36b..dca1940 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -1,3 +1,4 @@
++#include <chrono>
+ /**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+@@ -9,12 +10,16 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <set>
++#include <cstdlib>
+ #include <algorithm>
+ #include <array>
+ #include <cstdint>
+ #include <cstring>
+ #include <iterator>
+ #include <mutex>
++#include <memory>
++#include <map>
+ #include <string>
+ #include <string_view>
+ #include <tuple>
+@@ -33,6 +38,8 @@
+ #include <rex/graphics/pipeline/shader/shader.h>
+ #include <rex/graphics/pipeline/shader/spirv_translator.h>
+ #include <rex/graphics/registers.h>
++#include <atomic>
++#include <cstdio>
+ #include <rex/graphics/vulkan/command_processor.h>
+ #include <rex/graphics/vulkan/pipeline_cache.h>
+ #include <rex/graphics/vulkan/render_target_cache.h>
+@@ -2269,9 +2276,14 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
+   gamma_ramp_pwl_current_frame_ = UINT32_MAX;
+ }
+ 
++// swaps so far, for BARDOWN_TRACE_SWAPS
++static std::atomic<long> trace_swaps{0};
++
++
+ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                                        uint32_t frontbuffer_height) {
+   SCOPE_profile_cpu_f("gpu");
++  ++trace_swaps;
+   vertex_buffers_in_sync_[0] = 0;
+   vertex_buffers_in_sync_[1] = 0;
+ 
+@@ -3587,6 +3599,114 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
+   return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
+ }
+ 
++// BARDOWN_TRACE_PS=<pixel shader hashes, hex, comma separated> BARDOWN_TRACE_DIR=<dir>: for the first
++// 64 draws (BARDOWN_TRACE_MAX) with each pixel shader, write the shader constants and texture fetch constants, and copy each
++// bound texture's guest memory (4 MB from its base, once per address). offline tooling decodes it.
++// BARDOWN_TRACE_PS=list writes every distinct pixel shader drawn to <dir>/ps_list.txt instead.
++// hashes match the file names --dump_shaders writes
++static void TraceDraw(const RegisterFile& regs, memory::Memory* memory, const VulkanShader* vs,
++                      const VulkanShader* ps, uint32_t ib_base, uint32_t ib_bytes, uint32_t ib_count,
++                      bool ib_32bit) {
++  static const char* want = std::getenv("BARDOWN_TRACE_PS");
++  static const char* dir = std::getenv("BARDOWN_TRACE_DIR");
++  static std::mutex lock;
++  static std::set<uint32_t> textures_done;
++  // BARDOWN_TRACE_SWAPS=<from>: every indexed draw's constants for 3 swaps from that one, named by index buffer
++  static const long trace_from = std::getenv("BARDOWN_TRACE_SWAPS") ? std::atol(std::getenv("BARDOWN_TRACE_SWAPS")) : -1;
++  if (trace_from >= 0 && dir) {
++    const long swap = trace_swaps.load();
++    static const long trace_count =
++        std::getenv("BARDOWN_TRACE_SWAPS_COUNT") ? std::atol(std::getenv("BARDOWN_TRACE_SWAPS_COUNT")) : 5;
++    if (ib_base && swap >= trace_from && swap < trace_from + trace_count) {
++      static std::atomic<int> n_all{0};
++      const int n = n_all.fetch_add(1);
++      std::lock_guard<std::mutex> guard(lock);
++      if (FILE* f = std::fopen(fmt::format("{}/emu_{:08X}_{}_{:05}_s{}.bin", dir, ib_base, ib_count, n, swap).c_str(),
++                               "wb")) {
++        std::fwrite(&regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X], 4, 512 * 4, f);
++        std::fclose(f);
++      }
++    }
++    return;
++  }
++  if (!want || !dir) return;
++  if (!ps) return;
++  if (std::strcmp(want, "list") == 0) {
++    // every distinct pixel shader drawn, to find the one to trace
++    static std::set<uint64_t> seen;
++    std::lock_guard<std::mutex> guard(lock);
++    if (!seen.insert(ps->ucode_data_hash()).second) return;
++    if (FILE* f = std::fopen(fmt::format("{}/ps_list.txt", dir).c_str(), "a")) {
++      std::fprintf(f, "%016llX\n", (unsigned long long)ps->ucode_data_hash());
++      std::fclose(f);
++    }
++    return;
++  }
++  // a comma-separated list of hashes, 64 draws each
++  static const std::map<uint64_t, std::unique_ptr<std::atomic<int>>> wanted = [] {
++    std::map<uint64_t, std::unique_ptr<std::atomic<int>>> m;
++    std::string list = std::getenv("BARDOWN_TRACE_PS");
++    for (size_t at = 0; at < list.size();) {
++      size_t comma = list.find(',', at);
++      if (comma == std::string::npos) comma = list.size();
++      m.emplace(std::strtoull(list.substr(at, comma - at).c_str(), nullptr, 16),
++                std::make_unique<std::atomic<int>>(0));
++      at = comma + 1;
++    }
++    return m;
++  }();
++  auto hit = wanted.find(ps->ucode_data_hash());
++  if (hit == wanted.end()) return;
++  static const int limit = std::getenv("BARDOWN_TRACE_MAX") ? std::atoi(std::getenv("BARDOWN_TRACE_MAX")) : 64;
++  int n = hit->second->fetch_add(1);
++  if (n >= limit) return;
++  std::lock_guard<std::mutex> guard(lock);
++  auto path = fmt::format("{}/draw_{:016X}_{:03}.bin", dir, ps->ucode_data_hash(), n);
++  FILE* f = std::fopen(path.c_str(), "wb");
++  if (!f) return;
++  uint64_t hashes[2] = {vs ? vs->ucode_data_hash() : 0, ps->ucode_data_hash()};
++  std::fwrite("BTRC", 1, 4, f);
++  std::fwrite(hashes, sizeof(hashes), 1, f);
++  // 512 float4 constants (vertex 0-255, pixel 256-511), then 32 texture fetch constants
++  std::fwrite(&regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X], 4, 512 * 4, f);
++  std::fwrite(&regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], 4, 32 * 6, f);
++  // index buffer: guest address, bytes, index count, 32-bit flag (all zero for non-indexed draws)
++  uint32_t ib[4] = {ib_base, ib_bytes, ib_count, ib_32bit ? 1u : 0u};
++  std::fwrite(ib, sizeof(ib), 1, f);
++  // output state: blend, colour mask, depth, culling
++  uint32_t state[5] = {regs.values[XE_GPU_REG_RB_COLORCONTROL], regs.values[XE_GPU_REG_RB_BLENDCONTROL0],
++                       regs.values[XE_GPU_REG_RB_COLOR_MASK], regs.values[XE_GPU_REG_RB_DEPTHCONTROL],
++                       regs.values[XE_GPU_REG_PA_SU_SC_MODE_CNTL]};
++  std::fwrite(state, sizeof(state), 1, f);
++  std::fclose(f);
++  // vertex and index buffers, so meshes can be matched against the disc's rx2 base resources
++  auto copy = [&](const char* kind, uint32_t base, uint32_t bytes) {
++    if (!base || !bytes || base >= 0x20000000u || !textures_done.insert(base | 1u).second) return;
++    bytes = std::min(bytes, 0x20000000u - base);
++    if (FILE* b = std::fopen(fmt::format("{}/{}_{:08X}.bin", dir, kind, base).c_str(), "wb")) {
++      std::fwrite(memory->TranslatePhysical(base), 1, bytes, b);
++      std::fclose(b);
++    }
++  };
++  copy("ib", ib_base, ib_bytes);
++  for (uint32_t i = 0; i < 96; ++i) {
++    auto vf = regs.GetVertexFetch(i);
++    if (vf.type == xenos::FetchConstantType::kVertex && vf.size) copy("vb", vf.address << 2, vf.size << 2);
++  }
++  for (uint32_t i = 0; i < 32; ++i) {
++    auto fetch = regs.GetTextureFetch(i);
++    if (fetch.type != xenos::FetchConstantType::kTexture || !fetch.base_address) continue;
++    uint32_t base = fetch.base_address << 12;
++    if (!textures_done.insert(base).second) continue;
++    uint32_t size = std::min<uint32_t>(4u << 20, 0x20000000u - std::min(base, 0x20000000u));
++    auto tex_path = fmt::format("{}/tex_{:08X}.bin", dir, base);
++    FILE* t = std::fopen(tex_path.c_str(), "wb");
++    if (!t) continue;
++    std::fwrite(memory->TranslatePhysical(base), 1, size, t);
++    std::fclose(t);
++  }
++}
++
+ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
+                                        IndexBufferInfo* index_buffer_info,
+                                        bool major_mode_explicit) {
+@@ -3669,6 +3789,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+       return true;
+     }
+   }
++  TraceDraw(regs, memory_, vertex_shader, pixel_shader, index_buffer_info ? index_buffer_info->guest_base : 0,
++            index_buffer_info ? uint32_t(index_buffer_info->length) : 0, index_buffer_info ? index_buffer_info->count : 0,
++            index_buffer_info && index_buffer_info->format == xenos::IndexFormat::kInt32);
+   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
+   if (memexport_used_pixel) {
+     if (!device_properties.fragmentStoresAndAtomics) {
+@@ -4400,6 +4523,8 @@ bool VulkanCommandProcessor::IssueCopy() {
+   return IssueCopy_ReadbackResolvePath();
+ }
+ 
++constexpr uint32_t kReadbackSkipStreakFrames = 30;
++
+ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
+   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+@@ -4424,6 +4549,30 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
+     return true;
+   }
+ 
++  // REX_LOG_READBACK: once a second, how much the copy-back cost: calls, bytes, total and worst frame time
++  struct ReadbackTimer {
++    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
++    uint32_t length;
++    uint64_t frame;
++    explicit ReadbackTimer(uint32_t l, uint64_t f) : length(l), frame(f) {}
++    ~ReadbackTimer() {
++      if (!std::getenv("REX_LOG_READBACK")) return;
++      static uint64_t calls = 0, bytes = 0, cur_frame = 0;
++      static double total_ms = 0, frame_ms = 0, worst_frame_ms = 0;
++      static auto last = std::chrono::steady_clock::now();
++      const auto now = std::chrono::steady_clock::now();
++      const double ms = std::chrono::duration<double, std::milli>(now - t0).count();
++      if (frame != cur_frame) worst_frame_ms = std::max(worst_frame_ms, frame_ms), frame_ms = 0, cur_frame = frame;
++      ++calls, bytes += length, total_ms += ms, frame_ms += ms;
++      if (now - last > std::chrono::seconds(1)) {
++        REXGPU_INFO("[readback] {} calls, {} KB, {:.1f} ms total, worst frame {:.2f} ms", calls, bytes / 1024,
++                    total_ms, std::max(worst_frame_ms, frame_ms));
++        calls = bytes = 0, total_ms = worst_frame_ms = 0;
++        last = now;
++      }
++    }
++  } readback_timer(written_length, frame_current_);
++
+   auto ensure_readback_slot = [&](ReadbackBuffer& readback, uint32_t index, uint32_t size) -> bool {
+     if (readback.buffers[index] != VK_NULL_HANDLE && size <= readback.sizes[index] &&
+         readback.mapped_data[index] != nullptr) {
+@@ -4475,7 +4624,34 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
+   bool is_scaled = texture_cache_->IsDrawResolutionScaled();
+   uint64_t resolve_key = MakeReadbackResolveKey(written_address, written_length);
+   ReadbackBuffer& readback = readback_buffers_[resolve_key];
++  // resolved last frame too = per-frame data, a frame of lag is harmless. anything rarer (equipment
++  // composited once at load into a shared target) needs the exact result now
++  bool resolved_last_frame =
++      readback.last_used_frame != 0 && readback.last_used_frame + 1 >= frame_current_;
++  if (std::getenv("REX_LOG_READBACK")) {
++    // a count, once a second, of resolves that will make the cpu wait, by frames since that target was last
++    // resolved (0 = never)
++    static std::map<uint64_t, uint32_t> waits;
++    static auto last_report = std::chrono::steady_clock::now();
++    if (!resolved_last_frame)
++      ++waits[readback.last_used_frame ? std::min<uint64_t>(frame_current_ - readback.last_used_frame, 99) : 0];
++    const auto now = std::chrono::steady_clock::now();
++    if (now - last_report > std::chrono::seconds(1)) {
++      std::string line;
++      for (auto& [gap, n] : waits) line += fmt::format(" {}f:{}", gap, n);
++      if (!line.empty()) REXGPU_INFO("[readback] synchronous waits by gap:{}", line);
++      waits.clear();
++      last_report = now;
++    }
++  }
++  readback.streak = resolved_last_frame ? readback.streak + 1 : 0;
+   readback.last_used_frame = frame_current_;
++  // a target resolved every frame for half a second is the game's own drawing (the screen, its depth,
++  // post effects): the guest never reads it back on the cpu, and copying it cost ~1.8 GB a second and the
++  // hitches with it. only the rare resolves (equipment composited at load) need the data in guest memory
++  if (readback_mode == ReadbackResolveMode::kAuto && readback.streak >= kReadbackSkipStreakFrames) {
++    return true;
++  }
+   uint32_t write_index = readback.current_index;
+   uint32_t readback_size = AlignReadbackBufferSize(written_length);
+   if (!ensure_readback_slot(readback, write_index, readback_size)) {
+@@ -4650,7 +4826,8 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
+                           VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+ 
+   bool use_delayed_sync =
+-      readback_mode == ReadbackResolveMode::kFast || readback_mode == ReadbackResolveMode::kSome;
++      readback_mode == ReadbackResolveMode::kFast || readback_mode == ReadbackResolveMode::kSome ||
++      (readback_mode == ReadbackResolveMode::kAuto && resolved_last_frame);
+   uint32_t read_index = write_index;
+   if (use_delayed_sync) {
+     read_index = 1 - write_index;
+@@ -4682,6 +4859,18 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
+     uint8_t* destination = memory_->TranslatePhysical(written_address);
+     if (destination) {
+       std::memcpy(destination, readback.mapped_data[read_index], written_length);
++      if (std::getenv("REX_LOG_READBACK")) {
++        static std::map<uint32_t, uint64_t> by_addr;
++        static auto last = std::chrono::steady_clock::now();
++        by_addr[written_address] += written_length;
++        if (std::chrono::steady_clock::now() - last > std::chrono::seconds(1)) {
++          std::string line;
++          for (auto& [a, n] : by_addr) line += fmt::format(" {:08X}:{}KB", a, n / 1024);
++          REXGPU_INFO("[readback] written to guest:{}", line);
++          by_addr.clear();
++          last = std::chrono::steady_clock::now();
++        }
++      }
+     }
+   }
+ 
+@@ -6242,6 +6431,26 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
+       // losing blending correctness, but getting the full range.
+       color_exp_bias -= 5;
+     }
++    {
++      static const bool log_formats = [] {
++        const char* v = std::getenv("REX_LOG_RT_FORMATS");
++        return v && *v && *v != '0';
++      }();
++      if (log_formats && (normalized_color_mask >> (i * 4)) & 0xF) {
++        static std::mutex mutex;
++        static std::set<uint32_t> seen;
++        uint32_t key = (uint32_t(color_info.color_format) << 8) | uint8_t(color_info.color_exp_bias);
++        std::lock_guard lock(mutex);
++        if (seen.insert(key).second) {
++          REXGPU_INFO("[rt-formats] draw rt{} format={} color_exp_bias={} applied_exp_bias={} path={}", i,
++                      uint32_t(color_info.color_format), int32_t(color_info.color_exp_bias),
++                      color_exp_bias,
++                      render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets
++                          ? "host"
++                          : "fsi");
++        }
++      }
++    }
+     float color_exp_bias_scale;
+     *reinterpret_cast<int32_t*>(&color_exp_bias_scale) =
+         UINT32_C(0x3F800000) + (color_exp_bias << 23);
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 0298f06..2a15c4c 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -10,6 +10,8 @@
+  */
+ 
+ #include <algorithm>
++#include <cstdlib>
++#include <unordered_map>
+ #include <array>
+ #include <cstddef>
+ #include <cstdint>
+diff --git a/src/graphics/vulkan/shared_memory.cpp b/src/graphics/vulkan/shared_memory.cpp
+index 6788214..0e540cb 100644
+--- a/src/graphics/vulkan/shared_memory.cpp
++++ b/src/graphics/vulkan/shared_memory.cpp
+@@ -1,3 +1,7 @@
++#include <string>
++#include <cstdlib>
++#include <chrono>
++#include <map>
+ /**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+@@ -283,6 +287,27 @@ bool VulkanSharedMemory::UploadRanges(
+   command_processor_.SubmitBarriers(true);
+   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+   uint64_t submission_current = command_processor_.GetCurrentSubmission();
++  if (std::getenv("REX_LOG_UPLOADS")) {
++    // once a second: how much guest memory went up to the gpu, and the biggest ranges by address
++    static std::map<uint32_t, uint64_t> by_addr;
++    static uint64_t total = 0;
++    static auto last = std::chrono::steady_clock::now();
++    for (auto r : upload_page_ranges) {
++      by_addr[r.first << page_size_log2()] += uint64_t(r.second) << page_size_log2();
++      total += uint64_t(r.second) << page_size_log2();
++    }
++    if (std::chrono::steady_clock::now() - last > std::chrono::seconds(1)) {
++      std::vector<std::pair<uint64_t, uint32_t>> top;
++      for (auto& [a, n] : by_addr) top.push_back({n, a});
++      std::sort(top.rbegin(), top.rend());
++      std::string line;
++      for (size_t i = 0; i < top.size() && i < 6; ++i) line += fmt::format(" {:08X}:{}KB", top[i].second, top[i].first / 1024);
++      REXGPU_INFO("[uploads] {} MB/s, top:{}", total >> 20, line);
++      by_addr.clear();
++      total = 0;
++      last = std::chrono::steady_clock::now();
++    }
++  }
+   bool successful = true;
+   upload_regions_.clear();
+   VkBuffer upload_buffer_previous = VK_NULL_HANDLE;
+diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
+index 813bb1c..4f15a02 100644
+--- a/src/input/input_system.cpp
++++ b/src/input/input_system.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <cstdlib>
+ #include <algorithm>
+ #include <cmath>
+ 
+@@ -72,6 +73,7 @@ void InputSystem::SetActiveCallback(std::function<bool()> callback) {
+ }
+ 
+ void InputSystem::SetDeviceAssignment(std::unique_ptr<DeviceAssignment> assignment) {
++  std::lock_guard lock(mutex_);
+   assignment_ = std::move(assignment);
+   if (assignment_) {
+     assignment_->OnDevicesChanged(devices_);
+@@ -186,6 +188,7 @@ const DeviceInfo* InputSystem::DeviceInfoFor(DeviceId id) const {
+ 
+ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+                                       X_INPUT_CAPABILITIES* out_caps) {
++  std::lock_guard lock(mutex_);
+   SCOPE_profile_cpu_f("hid");
+   if (!out_caps || !assignment_) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+@@ -213,6 +216,7 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+ }
+ 
+ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
++  std::lock_guard lock(mutex_);
+   SCOPE_profile_cpu_f("hid");
+   if (!assignment_) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+@@ -245,6 +249,19 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+   if (!any) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
++  if (std::getenv("BARDOWN_INPUT_DEBUG")) {
++    // what the guest sees: one line whenever buttons or the packet change
++    static uint32_t last_packet = 0;
++    static uint16_t last_buttons = 0;
++    uint16_t buttons = merged.gamepad.buttons;
++    uint32_t packet = merged.packet_number;
++    if (packet != last_packet || buttons != last_buttons) {
++      REXLOG_INFO("[input-debug] user {} devices {} buttons {:04x} packet {:08x}", user_index, ids.size(),
++                  buttons, packet);
++      last_packet = packet;
++      last_buttons = buttons;
++    }
++  }
+   if (out_state) {
+     *out_state = merged;
+   }
+@@ -252,6 +269,7 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+ }
+ 
+ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
++  std::lock_guard lock(mutex_);
+   SCOPE_profile_cpu_f("hid");
+   if (!assignment_) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+@@ -294,6 +312,7 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
+ 
+ X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
+                                    X_INPUT_KEYSTROKE* out_keystroke) {
++  std::lock_guard lock(mutex_);
+   SCOPE_profile_cpu_f("hid");
+   if (!assignment_) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_video.cpp b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
+index 1254710..bb71144 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_video.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
+@@ -12,6 +12,8 @@
+ // Disable warnings about unused parameters for kernel functions
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+ 
++#include <cstdlib>
++#include <chrono>
+ #include <algorithm>
+ #include <atomic>
+ #include <string>
+@@ -445,6 +447,33 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
+                   mapped_u32 frontbuffer_ptr,  // ptr to frontbuffer address
+                   mapped_u32 texture_format_ptr, mapped_u32 color_space_ptr, mapped_u32 width,
+                   mapped_u32 height) {
++  // REX_LOG_FPS=1: log guest swaps per second, plus the slowest gap between two swaps
++  {
++    static const bool log_fps = [] {
++      const char* v = std::getenv("REX_LOG_FPS");
++      return v && *v && *v != '0';
++    }();
++    if (log_fps) {
++      using clock = std::chrono::steady_clock;
++      static clock::time_point window_start = clock::now(), last = clock::now();
++      static uint32_t swaps = 0;
++      static double worst_ms = 0;
++      static std::string gaps;
++      auto now = clock::now();
++      double gap = std::chrono::duration<double, std::milli>(now - last).count();
++      worst_ms = std::max(worst_ms, gap);
++      gaps += fmt::format("{:.0f} ", gap);
++      last = now;
++      ++swaps;
++      if (now - window_start >= std::chrono::seconds(1)) {
++        REXLOG_INFO("[fps] guest {} swaps/s, worst gap {:.1f} ms | {}", swaps, worst_ms, gaps);
++        window_start = now;
++        swaps = 0;
++        worst_ms = 0;
++        gaps.clear();
++      }
++    }
++  }
+   // All of these parameters are REQUIRED.
+   assert(buffer_ptr);
+   assert(fetch_ptr);
+diff --git a/src/system/function_dispatcher.cpp b/src/system/function_dispatcher.cpp
+index bd43109..f125979 100644
+--- a/src/system/function_dispatcher.cpp
++++ b/src/system/function_dispatcher.cpp
+@@ -23,6 +23,10 @@
+ #include <rex/system/function_dispatcher.h>
+ #include <rex/system/thread_state.h>
+ 
++#include <cstdlib>
++#include <mutex>
++#include <unordered_set>
++
+ namespace rex::runtime {
+ 
+ namespace {
+@@ -35,6 +39,21 @@ FunctionDispatcher* GetBoundFunctionDispatcher() {
+ }  // namespace
+ 
+ static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* /*base*/) {
++  // REX_HARVEST_UNREGISTERED=1 logs each missing target once as a manifest line and
++  // returns instead of dying. guest state is wrong afterwards, only use it to collect addresses.
++  static const bool harvest = [] {
++    const char* v = std::getenv("REX_HARVEST_UNREGISTERED");
++    return v && *v && *v != '0';
++  }();
++  if (harvest) {
++    static std::mutex mutex;
++    static std::unordered_set<uint32_t> seen;
++    std::lock_guard lock(mutex);
++    if (seen.insert(ctx.last_indirect_target).second) {
++      REXCPU_ERROR("[harvest] 0x{0:08X} = {{ name = \"sub_{0:08X}\" }}", ctx.last_indirect_target);
++    }
++    return;
++  }
+   REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X}",
+             ctx.last_indirect_target);
+ }
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index 76cc877..a6e741e 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <cstdlib>
+ #include <algorithm>
+ #include <cstring>
+ #include <utility>
+@@ -547,6 +548,10 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
+         "Unhandled guest access violation: {} of guest 0x{:08X} (host 0x{:016X}) on thread 0x{:X}",
+         is_write ? "write" : "read", virtual_address, reinterpret_cast<uintptr_t>(host_address),
+         rex::thread::current_thread_id());
++    // REX_ABORT_ON_GUEST_AV=1: die here so the core dump still holds the faulting guest frame
++    if (const char* v = std::getenv("REX_ABORT_ON_GUEST_AV"); v && *v && *v != '0') {
++      std::abort();
++    }
+     return false;
+   }
+ 
+diff --git a/src/ui/overlay/settings_overlay.cpp b/src/ui/overlay/settings_overlay.cpp
+index 4ede107..91062fc 100644
+--- a/src/ui/overlay/settings_overlay.cpp
++++ b/src/ui/overlay/settings_overlay.cpp
+@@ -199,7 +199,12 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
+   const std::string search(search_buf_);
+   const bool searching = !search.empty();
+ 
+-  ImGui::SetNextWindowSize(ImVec2(620, 480), ImGuiCond_FirstUseEver);
++  // sizes are in units of the font (10 px when this was laid out), so the window keeps its shape at any
++  // font size; it opens at most of the screen
++  const float u = ImGui::GetFontSize() / 10.0f;
++  const ImVec2 display = ImGui::GetIO().DisplaySize;
++  ImGui::SetNextWindowSize(ImVec2(std::max(620.0f * u, display.x * 0.7f), std::max(480.0f * u, display.y * 0.7f)),
++                           ImGuiCond_FirstUseEver);
+   ImGui::SetNextWindowBgAlpha(0.85f);
+   if (!ImGui::Begin("Settings##rex", nullptr, ImGuiWindowFlags_NoCollapse)) {
+     ImGui::End();
+@@ -214,8 +219,8 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
+ 
+   ImGui::Separator();
+ 
+-  const float panel_width = 160.0f;
+-  ImGui::BeginChild("##cats", ImVec2(panel_width, -30.0f), true);
++  const float panel_width = 260.0f * u;
++  ImGui::BeginChild("##cats", ImVec2(panel_width, -30.0f * u), true);
+ 
+   // Recursive lambda to draw the category tree.
+   std::function<void(const std::map<std::string, CatNode>&, int)> draw_tree;
+@@ -225,12 +230,12 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
+         // Leaf node - selectable
+         bool selected = (selected_category_ == node.full_path);
+         if (depth > 0)
+-          ImGui::Indent(8.0f);
++          ImGui::Indent(8.0f * u);
+         if (ImGui::Selectable(node.label.c_str(), selected)) {
+           selected_category_ = node.full_path;
+         }
+         if (depth > 0)
+-          ImGui::Unindent(8.0f);
++          ImGui::Unindent(8.0f * u);
+       } else {
+         // Parent node with children - use tree node
+         ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_OpenOnArrow;
+@@ -289,7 +294,7 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
+            (cat.size() > 15 && cat.compare(0, 15, "Input/Keybinds/") == 0);
+   };
+ 
+-  ImGui::BeginChild("##cvars", ImVec2(0, -30.0f), false);
++  ImGui::BeginChild("##cvars", ImVec2(0, -30.0f * u), false);
+   for (auto& entry : registry) {
+     // Filter by category (unless searching).
+     if (!searching) {
+@@ -334,12 +339,12 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
+ 
+       // Show description as label (e.g. "A button"), not the raw CVAR name
+       ImGui::Text("%-20s", entry.description.c_str());
+-      ImGui::SameLine(240.0f);
++      ImGui::SameLine(340.0f * u);
+ 
+       bool is_capturing = (capturing_bind_name_ == entry.name);
+ 
+       if (is_capturing) {
+-        ImGui::Button("Press any key...##v", ImVec2(140.0f, 0));
++        ImGui::Button("Press any key...##v", ImVec2(140.0f * u, 0));
+ 
+         if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+           capturing_bind_name_.clear();
+@@ -368,7 +373,7 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
+           }
+         }
+       } else {
+-        ImGui::SetNextItemWidth(80.0f);
++        ImGui::SetNextItemWidth(80.0f * u);
+         ImGui::Text("%-10s", current_val.c_str());
+         ImGui::SameLine();
+         if (ImGui::SmallButton("Rebind##v")) {
+@@ -429,9 +434,9 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
+           ImGui::SetTooltip("[%s]", lifecycle_label);
+         }
+       }
+-      ImGui::SameLine(240.0f);
++      ImGui::SameLine(340.0f * u);
+ 
+-      ImGui::SetNextItemWidth(160.0f);
++      ImGui::SetNextItemWidth(220.0f * u);
+       if (entry.type == rex::cvar::FlagType::Boolean) {
+         bool v = rex::string::from_string<bool>(current_val, false);
+         if (ImGui::Checkbox("##v", &v)) {
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index 7360ed9..989431e 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -11,6 +11,9 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <chrono>
++#include <mutex>
++#include <condition_variable>
+ #include <cctype>
+ #include <utility>
+ 
+@@ -546,10 +549,55 @@ void Presenter::PaintFromUIThread(bool force_paint) {
+   }
+ }
+ 
++namespace {
++// set while a renderer other than the gpu emulation owns the picture; only its refreshes get through
++std::atomic<bool> guest_output_external{false};
++thread_local bool external_refresh = false;
++}  // namespace
++
++void SetGuestOutputExternal(bool external) { guest_output_external.store(external); }
++
++namespace {
++std::mutex external_frames_mutex;
++std::condition_variable external_frames_cv;
++uint64_t external_frames_done = 0, external_frames_taken = 0;
++}  // namespace
++
++void ExternalFrameDone() {
++  {
++    std::lock_guard lock(external_frames_mutex);
++    ++external_frames_done;
++  }
++  external_frames_cv.notify_all();
++}
++
++bool WaitExternalFrame(std::chrono::milliseconds limit) {
++  if (!guest_output_external.load()) return true;
++  std::unique_lock lock(external_frames_mutex);
++  if (!external_frames_cv.wait_for(lock, limit, [] { return external_frames_done > external_frames_taken; }))
++    return false;
++  ++external_frames_taken;
++  return true;
++}
++
++bool RefreshGuestOutputExternal(Presenter& presenter, uint32_t frontbuffer_width,
++                                uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
++                                uint32_t display_aspect_ratio_y,
++                                std::function<bool(Presenter::GuestOutputRefreshContext& context)> refresher) {
++  external_refresh = true;
++  bool refreshed = presenter.RefreshGuestOutput(frontbuffer_width, frontbuffer_height, display_aspect_ratio_x,
++                                                display_aspect_ratio_y, std::move(refresher));
++  external_refresh = false;
++  return refreshed;
++}
++
+ bool Presenter::RefreshGuestOutput(
+     uint32_t frontbuffer_width, uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
+     uint32_t display_aspect_ratio_y,
+     std::function<bool(GuestOutputRefreshContext& context)> refresher) {
++  if (guest_output_external.load(std::memory_order_relaxed) && !external_refresh) {
++    return false;
++  }
+   GuestOutputProperties& writable_properties =
+       guest_output_properties_[guest_output_mailbox_writable_];
+   writable_properties.frontbuffer_width = frontbuffer_width;
+diff --git a/src/ui/renderdoc_api.cpp b/src/ui/renderdoc_api.cpp
+index e1a5287..b22006a 100644
+--- a/src/ui/renderdoc_api.cpp
++++ b/src/ui/renderdoc_api.cpp
+@@ -12,6 +12,10 @@
+ #include <rex/logging.h>
+ #include <rex/ui/renderdoc_api.h>
+ 
++#if REX_PLATFORM_LINUX
++#include <dlfcn.h>
++#endif
++
+ namespace rex {
+ namespace ui {
+ 
+@@ -28,6 +32,15 @@ std::unique_ptr<RenderDocAPI> RenderDocAPI::CreateIfConnected() {
+   // Try to load the RenderDoc library. If RenderDoc is attached, the library
+   // should already be loaded into the process and this will increment the
+   // reference count. If not attached, the load will fail and we return nullptr.
++#if REX_PLATFORM_LINUX
++  // a plain dlopen succeeds whenever renderdoc is merely installed and injects it into
++  // every run (it then refuses wayland). only attach when it's already in the process
++  if (void* attached = dlopen(platform::lib_names::kRenderDoc, RTLD_NOW | RTLD_NOLOAD)) {
++    dlclose(attached);
++  } else {
++    return nullptr;
++  }
++#endif
+   if (!renderdoc_api->library_.Load(platform::lib_names::kRenderDoc)) {
+     return nullptr;
+   }
+diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
+index 8197bb4..5b12a36 100644
+--- a/src/ui/vulkan/vulkan_device.cpp
++++ b/src/ui/vulkan/vulkan_device.cpp
+@@ -650,6 +650,19 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+       XE_UI_VULKAN_FEATURE_2(features_1_2, samplerMirrorClampToEdge);
+       XE_UI_VULKAN_FEATURE_2(features_1_2, uniformBufferStandardLayout);
+       XE_UI_VULKAN_FEATURE_2(features_1_2, scalarBlockLayout);
++      // for bardown's native renderer: its shaders read constants through buffer addresses and pick textures
++      // out of bindless arrays. the emulation never uses these
++      for (VkBool32 VkPhysicalDeviceVulkan12Features::*f :
++           {&VkPhysicalDeviceVulkan12Features::bufferDeviceAddress,
++            &VkPhysicalDeviceVulkan12Features::descriptorIndexing,
++            &VkPhysicalDeviceVulkan12Features::runtimeDescriptorArray,
++            &VkPhysicalDeviceVulkan12Features::descriptorBindingPartiallyBound,
++            &VkPhysicalDeviceVulkan12Features::descriptorBindingVariableDescriptorCount,
++            &VkPhysicalDeviceVulkan12Features::descriptorBindingSampledImageUpdateAfterBind,
++            &VkPhysicalDeviceVulkan12Features::shaderSampledImageArrayNonUniformIndexing}) {
++        features_1_2.enabled.*f = features_1_2.supported.*f;
++      }
++      enabled_features.shaderInt64 = supported_features.shaderInt64;
+     }
+   } else {
+     if (ext_1_2_KHR_sampler_mirror_clamp_to_edge) {

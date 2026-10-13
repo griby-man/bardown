@@ -1,0 +1,24 @@
+# a build environment on Ubuntu 22.04, so the AppImage needs nothing newer than glibc 2.35. clang 20 from
+# apt.llvm.org, libstdc++ 13 from the toolchain PPA (linked statically, so it isn't needed at run time),
+# cmake from Kitware
+#   podman build -t bardown-build -f packaging/Containerfile packaging
+#   podman run --rm -v "$PWD":/src:Z -w /src bardown-build scripts/build-compat.sh
+FROM docker.io/library/ubuntu:22.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl gnupg software-properties-common lsb-release wget \
+ && add-apt-repository -y ppa:ubuntu-toolchain-r/test \
+ && curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /usr/share/keyrings/llvm.gpg \
+ && echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/jammy/ llvm-toolchain-jammy-20 main" \
+      > /etc/apt/sources.list.d/llvm.list \
+ && curl -fsSL https://apt.kitware.com/keys/kitware-archive-latest.asc | gpg --dearmor -o /usr/share/keyrings/kitware.gpg \
+ && echo "deb [signed-by=/usr/share/keyrings/kitware.gpg] https://apt.kitware.com/ubuntu/ jammy main" \
+      > /etc/apt/sources.list.d/kitware.list \
+ && apt-get update && apt-get install -y --no-install-recommends \
+      clang-20 lld-20 llvm-20 libstdc++-13-dev g++-13 cmake ninja-build pkg-config git python3 file \
+      libx11-xcb-dev libwayland-dev libxkbcommon-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+      libxss-dev libxinerama-dev libxfixes-dev libxtst-dev libdbus-1-dev libudev-dev \
+      libasound2-dev libpulse-dev libpipewire-0.3-dev libdecor-0-dev libegl-dev libgl-dev \
+ && rm -rf /var/lib/apt/lists/* \
+ && ln -sf /usr/bin/clang-20 /usr/bin/clang && ln -sf /usr/bin/clang++-20 /usr/bin/clang++ \
+ && for t in llvm-ar llvm-ranlib llvm-strip lld ld.lld; do ln -sf /usr/bin/$t-20 /usr/bin/$t; done

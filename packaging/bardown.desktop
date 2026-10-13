@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=bardown
+GenericName=NHL 14
+Comment=NHL 14 for the Xbox 360, running natively. Needs your own copy of the game.
+Exec=bardown
+Icon=bardown
+Categories=Game;SportsGame;
+Terminal=false

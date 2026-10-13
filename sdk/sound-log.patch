@@ -1,0 +1,64 @@
+diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
+index 11b83be..009ac4e 100644
+--- a/src/audio/xma_context.cpp
++++ b/src/audio/xma_context.cpp
+@@ -10,7 +10,13 @@
+ */
+ 
+ #include <algorithm>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
++#include <mutex>
++#include <string>
++#include <unordered_map>
+ 
+ #include <rex/audio/xma/context.h>
+ #include <rex/audio/xma/decoder.h>
+@@ -38,6 +44,36 @@ extern "C" {
+ 
+ namespace rex::audio {
+ 
++namespace {
++
++// BARDOWN_SOUND_LOG=<dir>: every input buffer a context starts on goes to <dir>/xma.txt with its
++// first bytes, so what the game plays can be matched to its sound banks.
++// a line: steady-clock ns, context, buffer address, packet count, 64 bytes hex
++void LogInputBuffer(uint32_t context, uint32_t address, uint32_t packets, const uint8_t* bytes) {
++  static std::mutex mutex;
++  static FILE* out = [] {
++    const char* dir = std::getenv("BARDOWN_SOUND_LOG");
++    return dir && *dir ? std::fopen((std::string(dir) + "/xma.txt").c_str(), "w") : nullptr;
++  }();
++  // a voice can reuse one buffer for the next sound, so it's the address and the bytes
++  static std::unordered_map<uint32_t, std::pair<uint32_t, uint64_t>> last;
++  if (!out) return;
++  uint64_t head;
++  std::memcpy(&head, bytes, 8);
++  std::lock_guard lock(mutex);
++  auto& seen = last[context];
++  if (seen.first == address && seen.second == head) return;
++  seen = {address, head};
++  auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
++                std::chrono::steady_clock::now().time_since_epoch()).count();
++  std::fprintf(out, "%lld %u %08x %u ", static_cast<long long>(ns), context, address, packets);
++  for (int i = 0; i < 64; ++i) std::fprintf(out, "%02x", bytes[i]);
++  std::fprintf(out, "\n");
++  std::fflush(out);
++}
++
++}  // namespace
++
+ using stream::BitStream;
+ 
+ const uint32_t XmaContext::kBitsPerPacketHeader;
+@@ -544,6 +580,8 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+   }
+ 
+   uint8_t* current_input_buffer = GetCurrentInputBuffer(data);
++  LogInputBuffer(id_, data->GetCurrentInputBufferAddress(), data->GetCurrentInputBufferPacketCount(),
++                 current_input_buffer);
+ 
+   input_buffer_.fill(0);
+ 
