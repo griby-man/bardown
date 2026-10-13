@@ -8,6 +8,10 @@ What changed, newest first. Dates are when it landed.
   thousands of times a second while the game made 60: the GPU sat at full clock (about 200 W on an RTX
   3090 at 4K, with coil whine). Frames now go out in step with the display; the same 4K game draws about
   10 W over an idle desktop. `vsync_display` turns it off.
+- **Even motion.** The window was redrawn on its own loop rather than when the game finished a frame, so
+  about once a second a frame was shown twice and the next one skipped: a small stall and jump in
+  play. Each game frame is now shown once, as it's made (60 a second in play, 30 in menus and cutscenes,
+  as on the Xbox). The log counts any repeated or skipped frames every 10 seconds (`[present]`).
 - **Frame limit** in the settings (Display, `present_frame_limit`) caps the frames a second sent to the
   screen.
 

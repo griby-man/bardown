@@ -55,37 +55,6 @@ index 1cb3faa..a150134 100644
    std::vector<InputDriver*> device_owners_;
  };
  
-diff --git a/include/rex/ui/external_output.h b/include/rex/ui/external_output.h
-new file mode 100644
-index 0000000..a5e046a
---- /dev/null
-+++ b/include/rex/ui/external_output.h
-@@ -0,0 +1,25 @@
-+#pragma once
-+
-+#include <chrono>
-+#include <cstdint>
-+#include <functional>
-+
-+#include <rex/ui/presenter.h>
-+
-+namespace rex::ui {
-+
-+// lets a renderer outside the gpu emulation own the picture: while set, the emulation's swaps no longer
-+// refresh the guest output, and the outside renderer refreshes it through RefreshGuestOutputExternal
-+void SetGuestOutputExternal(bool external);
-+bool RefreshGuestOutputExternal(Presenter& presenter, uint32_t frontbuffer_width,
-+                                uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
-+                                uint32_t display_aspect_ratio_y,
-+                                std::function<bool(Presenter::GuestOutputRefreshContext& context)> refresher);
-+
-+// the outside renderer has taken a frame's data (called at each of its swaps). a gpu front end that draws
-+// nothing holds each swap until then, so fences after it don't tell the game the frame is done before it was
-+// read, as the 360's GPU, a frame behind, never did. returns false if the wait ran out
-+void ExternalFrameDone();
-+bool WaitExternalFrame(std::chrono::milliseconds limit);
-+
-+}  // namespace rex::ui
 diff --git a/src/codegen/builders/vector.cpp b/src/codegen/builders/vector.cpp
 index cbdd7f7..869afd2 100644
 --- a/src/codegen/builders/vector.cpp
@@ -1153,76 +1122,6 @@ index 4ede107..91062fc 100644
        if (entry.type == rex::cvar::FlagType::Boolean) {
          bool v = rex::string::from_string<bool>(current_val, false);
          if (ImGui::Checkbox("##v", &v)) {
-diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
-index 7360ed9..989431e 100644
---- a/src/ui/presenter.cpp
-+++ b/src/ui/presenter.cpp
-@@ -11,6 +11,9 @@
- 
- #include <algorithm>
- #include <atomic>
-+#include <chrono>
-+#include <mutex>
-+#include <condition_variable>
- #include <cctype>
- #include <utility>
- 
-@@ -546,10 +549,55 @@ void Presenter::PaintFromUIThread(bool force_paint) {
-   }
- }
- 
-+namespace {
-+// set while a renderer other than the gpu emulation owns the picture; only its refreshes get through
-+std::atomic<bool> guest_output_external{false};
-+thread_local bool external_refresh = false;
-+}  // namespace
-+
-+void SetGuestOutputExternal(bool external) { guest_output_external.store(external); }
-+
-+namespace {
-+std::mutex external_frames_mutex;
-+std::condition_variable external_frames_cv;
-+uint64_t external_frames_done = 0, external_frames_taken = 0;
-+}  // namespace
-+
-+void ExternalFrameDone() {
-+  {
-+    std::lock_guard lock(external_frames_mutex);
-+    ++external_frames_done;
-+  }
-+  external_frames_cv.notify_all();
-+}
-+
-+bool WaitExternalFrame(std::chrono::milliseconds limit) {
-+  if (!guest_output_external.load()) return true;
-+  std::unique_lock lock(external_frames_mutex);
-+  if (!external_frames_cv.wait_for(lock, limit, [] { return external_frames_done > external_frames_taken; }))
-+    return false;
-+  ++external_frames_taken;
-+  return true;
-+}
-+
-+bool RefreshGuestOutputExternal(Presenter& presenter, uint32_t frontbuffer_width,
-+                                uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
-+                                uint32_t display_aspect_ratio_y,
-+                                std::function<bool(Presenter::GuestOutputRefreshContext& context)> refresher) {
-+  external_refresh = true;
-+  bool refreshed = presenter.RefreshGuestOutput(frontbuffer_width, frontbuffer_height, display_aspect_ratio_x,
-+                                                display_aspect_ratio_y, std::move(refresher));
-+  external_refresh = false;
-+  return refreshed;
-+}
-+
- bool Presenter::RefreshGuestOutput(
-     uint32_t frontbuffer_width, uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
-     uint32_t display_aspect_ratio_y,
-     std::function<bool(GuestOutputRefreshContext& context)> refresher) {
-+  if (guest_output_external.load(std::memory_order_relaxed) && !external_refresh) {
-+    return false;
-+  }
-   GuestOutputProperties& writable_properties =
-       guest_output_properties_[guest_output_mailbox_writable_];
-   writable_properties.frontbuffer_width = frontbuffer_width;
 diff --git a/src/ui/renderdoc_api.cpp b/src/ui/renderdoc_api.cpp
 index e1a5287..b22006a 100644
 --- a/src/ui/renderdoc_api.cpp
@@ -1278,8 +1177,154 @@ index 8197bb4..5b12a36 100644
      }
    } else {
      if (ext_1_2_KHR_sampler_mirror_clamp_to_edge) {
+diff --git a/include/rex/ui/external_output.h b/include/rex/ui/external_output.h
+new file mode 100644
+index 0000000..a525cee
+--- /dev/null
++++ b/include/rex/ui/external_output.h
+@@ -0,0 +1,28 @@
++#pragma once
++
++#include <chrono>
++#include <cstdint>
++#include <functional>
++
++#include <rex/ui/presenter.h>
++
++namespace rex::ui {
++
++// lets a renderer outside the gpu emulation own the picture: while set, the emulation's swaps no longer
++// refresh the guest output, and the outside renderer refreshes it through RefreshGuestOutputExternal
++void SetGuestOutputExternal(bool external);
++
++// how many frames the guest output has been given so far
++uint64_t GuestOutputRefreshCount();
++bool RefreshGuestOutputExternal(Presenter& presenter, uint32_t frontbuffer_width,
++                                uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
++                                uint32_t display_aspect_ratio_y,
++                                std::function<bool(Presenter::GuestOutputRefreshContext& context)> refresher);
++
++// the outside renderer has taken a frame's data (called at each of its swaps). a gpu front end that draws
++// nothing holds each swap until then, so fences after it don't tell the game the frame is done before it was
++// read, as the 360's GPU, a frame behind, never did. returns false if the wait ran out
++void ExternalFrameDone();
++bool WaitExternalFrame(std::chrono::milliseconds limit);
++
++}  // namespace rex::ui
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index 7360ed9..a0059bc 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -11,6 +11,9 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <chrono>
++#include <mutex>
++#include <condition_variable>
+ #include <cctype>
+ #include <utility>
+ 
+@@ -277,6 +280,19 @@ GuestOutputPaintConfig BuildGuestOutputPaintConfigFromCVar() {
+ namespace rex {
+ namespace ui {
+ 
++namespace {
++std::atomic<uint64_t> guest_output_refreshes{0};
++std::atomic<int64_t> guest_output_last_refresh{0};  // steady clock, ns
++}  // namespace
++
++// the game is handing over frames. the ui then repaints with each of them rather than on its own loop, which
++// on its own clock showed some game frames twice and skipped others, a hitch about once a second
++static bool GuestOutputLive() {
++  const int64_t now = std::chrono::steady_clock::now().time_since_epoch().count();
++  return now - guest_output_last_refresh.load(std::memory_order_relaxed) < 100'000'000;
++}
++
++
+ void Presenter::FatalErrorHostGpuLossCallback([[maybe_unused]] bool is_responsible,
+                                               [[maybe_unused]] bool statically_from_ui_thread) {
+   rex::FatalError("Graphics device lost (probably due to an internal error)");
+@@ -537,7 +553,7 @@ void Presenter::PaintFromUIThread(bool force_paint) {
+         (draw_ui && ui_drawers_.empty())) {
+       request_repaint_immediately = true;
+     }
+-    if (request_ui_paint_after_current_ui_thread_paint_ && !ui_drawers_.empty()) {
++    if (request_ui_paint_after_current_ui_thread_paint_ && !ui_drawers_.empty() && !GuestOutputLive()) {
+       request_repaint_at_tick = true;
+     }
+   }
+@@ -546,10 +562,58 @@ void Presenter::PaintFromUIThread(bool force_paint) {
+   }
+ }
+ 
++namespace {
++// set while a renderer other than the gpu emulation owns the picture; only its refreshes get through
++std::atomic<bool> guest_output_external{false};
++thread_local bool external_refresh = false;
++}  // namespace
++
++void SetGuestOutputExternal(bool external) { guest_output_external.store(external); }
++
++
++uint64_t GuestOutputRefreshCount() { return guest_output_refreshes.load(std::memory_order_relaxed); }
++
++namespace {
++std::mutex external_frames_mutex;
++std::condition_variable external_frames_cv;
++uint64_t external_frames_done = 0, external_frames_taken = 0;
++}  // namespace
++
++void ExternalFrameDone() {
++  {
++    std::lock_guard lock(external_frames_mutex);
++    ++external_frames_done;
++  }
++  external_frames_cv.notify_all();
++}
++
++bool WaitExternalFrame(std::chrono::milliseconds limit) {
++  if (!guest_output_external.load()) return true;
++  std::unique_lock lock(external_frames_mutex);
++  if (!external_frames_cv.wait_for(lock, limit, [] { return external_frames_done > external_frames_taken; }))
++    return false;
++  ++external_frames_taken;
++  return true;
++}
++
++bool RefreshGuestOutputExternal(Presenter& presenter, uint32_t frontbuffer_width,
++                                uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
++                                uint32_t display_aspect_ratio_y,
++                                std::function<bool(Presenter::GuestOutputRefreshContext& context)> refresher) {
++  external_refresh = true;
++  bool refreshed = presenter.RefreshGuestOutput(frontbuffer_width, frontbuffer_height, display_aspect_ratio_x,
++                                                display_aspect_ratio_y, std::move(refresher));
++  external_refresh = false;
++  return refreshed;
++}
++
+ bool Presenter::RefreshGuestOutput(
+     uint32_t frontbuffer_width, uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
+     uint32_t display_aspect_ratio_y,
+     std::function<bool(GuestOutputRefreshContext& context)> refresher) {
++  if (guest_output_external.load(std::memory_order_relaxed) && !external_refresh) {
++    return false;
++  }
+   GuestOutputProperties& writable_properties =
+       guest_output_properties_[guest_output_mailbox_writable_];
+   writable_properties.frontbuffer_width = frontbuffer_width;
+@@ -567,6 +631,9 @@ bool Presenter::RefreshGuestOutput(
+       return false;
+     }
+     guest_output_active_last_refresh_ = true;
++    guest_output_refreshes.fetch_add(1, std::memory_order_relaxed);
++    guest_output_last_refresh.store(std::chrono::steady_clock::now().time_since_epoch().count(),
++                                    std::memory_order_relaxed);
+   } else {
+     // Request presenting a blank image if there was a true image previously,
+     // but not now.
 diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
-index 23645ef..eab2dc6 100644
+index 23645ef..a12ee06 100644
 --- a/src/ui/vulkan/vulkan_presenter.cpp
 +++ b/src/ui/vulkan/vulkan_presenter.cpp
 @@ -11,11 +11,15 @@
@@ -1298,7 +1343,15 @@ index 23645ef..eab2dc6 100644
  #include <utility>
  #include <vector>
  
-@@ -58,6 +62,10 @@ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_mailbox, true, "UI/Vulkan",
+@@ -24,6 +28,7 @@
+ #include <rex/logging.h>
+ #include <rex/math.h>
+ #include <rex/platform.h>
++#include <rex/ui/external_output.h>
+ #include <rex/ui/vulkan/presenter.h>
+ #include <rex/ui/vulkan/util.h>
+ 
+@@ -58,6 +63,10 @@ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_mailbox, true, "UI/Vulkan",
  REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_fifo_relaxed, true, "UI/Vulkan",
                      "Allow FIFO relaxed present mode");
  
@@ -1309,7 +1362,7 @@ index 23645ef..eab2dc6 100644
  namespace rex {
  namespace ui {
  namespace vulkan {
-@@ -2236,12 +2244,40 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+@@ -2236,12 +2245,46 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
    present_info.pSwapchains = &paint_context_.swapchain;
    present_info.pImageIndices = &swapchain_image_index;
    present_info.pResults = nullptr;
@@ -1335,15 +1388,21 @@ index 23645ef..eab2dc6 100644
          vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
      present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
    }
-+  // how often frames reach the window, every 10 s; the game itself makes 60
++  // how often frames reach the window, every 10 s, and how evenly the game's own frames got there: shown
++  // again on the next present, or replaced before any present showed them (each is a visible hitch)
 +  {
-+    static uint64_t presents = 0;
++    static uint64_t presents = 0, repeats = 0, dropped = 0, last_frame = 0;
 +    static auto window_start = std::chrono::steady_clock::now();
 +    ++presents;
++    const uint64_t frame = GuestOutputRefreshCount();
++    if (frame == last_frame) ++repeats;
++    else if (last_frame && frame > last_frame + 1) dropped += frame - last_frame - 1;
++    last_frame = frame;
 +    const auto now = std::chrono::steady_clock::now();
 +    if (now - window_start >= std::chrono::seconds(10)) {
-+      REXLOG_INFO("[present] {:.0f} a second", presents / std::chrono::duration<double>(now - window_start).count());
-+      presents = 0;
++      REXLOG_INFO("[present] {:.0f} a second; game frames shown twice {}, never shown {}",
++                  presents / std::chrono::duration<double>(now - window_start).count(), repeats, dropped);
++      presents = repeats = dropped = 0;
 +      window_start = now;
 +    }
 +  }
