@@ -23,30 +23,34 @@ bardown runs NHL 14 as a native program, with no CPU emulation and no GPU emulat
 
 ## Where it is
 
-Every offline mode I've tried plays from start to finish without crashing:
+The offline modes below have been tested from start to finish without crashing, in scripted test runs (the
+game driven by recorded button presses). Some have also been played by hand on the current version, by me and
+a friend ([Codeburglar55](https://codeberg.org/Codeburglar55) on Codeberg,
+[cigar-city-code](https://github.com/cigar-city-code) on GitHub):
 
-| Mode | Checked |
-|---|---|
-| Play Now | a full game, opening faceoff to the post-game screen |
-| Season | new season, saving, loading, simulating a month, save and exit |
-| Be a GM | a new career, the salary cap, simulating preseason |
-| Live the Life (Be a Pro) | picking a player, the career hub, shifts with the pro camera, instant replay |
-| Be a Legend | Roenick (Lemieux and Gretzky unlock in Be a Pro, as on the Xbox) |
-| NHL 94 Anniversary | in play |
-| Winter Classic | the flyover and the outdoor rink |
-| NHL Moments Live | the 2012-13 moments on the disc |
-| Shootout, Playoffs | a shootout; a playoff round simulated |
+| Mode | Tested | Played |
+|---|---|---|
+| Play Now | a full game, opening faceoff to the post-game screen | yes |
+| Season | new season, saving, loading, simulating a month, save and exit | yes |
+| Tutorials | | yes |
+| Be a GM | a new career, the salary cap, simulating preseason | |
+| Live the Life (Be a Pro) | picking a player, the career hub, shifts with the pro camera, instant replay | |
+| Be a Legend | Roenick (Lemieux and Gretzky unlock in Be a Pro, as on the Xbox) | |
+| NHL 94 Anniversary | in play | |
+| Winter Classic | the flyover and the outdoor rink | |
+| NHL Moments Live | the 2012-13 moments on the disc | |
+| Shootout, Playoffs | a shootout; a playoff round simulated | |
 
-Those runs were made in 0.1.0, on the emulated GPU. The native renderer has been checked since in the
+The scripted runs were made in 0.1.0, on the emulated GPU; the native renderer has been checked since in the
 menus and in full games, but not mode by mode.
 
-Not tried yet: Practice, the Tutorials, Tournament Mode, Battle for the Cup, and a long Be a GM run
-through the trade deadline and the draft. Hockey Ultimate Team, online play and the 2013-14 Moments
-Live downloads needed EA's servers, which are long gone.
+Not tried yet: Practice, Tournament Mode, Battle for the Cup, and a long Be a GM run through the trade
+deadline and the draft. Hockey Ultimate Team, online play and the 2013-14 Moments Live downloads needed EA's
+servers, which are long gone.
 
 Known issues:
 
-- a soft "psh" in the audio now and then; not tracked down yet
+- a short buzz in the audio now and then; not tracked down yet
 - cutscenes run at 30 fps, as they do on the Xbox; gameplay and menus run at 60
 
 ![The opening faceoff](docs/images/faceoff.jpg)
