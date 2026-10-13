@@ -793,7 +793,10 @@ void Draw(uint8_t* base, uint32_t dev, Route route, const DrawCall& call) {
   key.cull = (mode & 1 ? VK_CULL_MODE_FRONT_BIT : 0) | (mode & 2 ? VK_CULL_MODE_BACK_BIT : 0);
   key.front_cw = (mode >> 2) & 1;
   const uint32_t colorctl = g::Reg(base, dev, 0x2202);
-  if (colorctl & 8) key.spec |= kSpecAlphaTest;
+  // alpha to mask (bit 4) splits a pixel's coverage by alpha across the 360's samples; with one sample here that
+  // comes to keeping the texels at least half opaque. nets and fences use it, and drew solid without it
+  const bool alpha_to_mask = (colorctl & 0x10) && !(colorctl & 8);
+  if ((colorctl & 8) || alpha_to_mask) key.spec |= kSpecAlphaTest;
 
   // vertices
   struct Stream {
@@ -1052,7 +1055,7 @@ void Draw(uint8_t* base, uint32_t dev, Route route, const DrawCall& call) {
     const float half[2] = {sx ? 0.5f / sx : 0.0f, sy ? 0.5f / sy : 0.0f};
     std::memcpy(&sc[130], half, sizeof(half));
   }
-  const float alpha_ref = RegF(base, dev, 0x210E);
+  const float alpha_ref = alpha_to_mask ? 0.5f : RegF(base, dev, 0x210E);
   std::memcpy(&sc[132], &alpha_ref, 4);
   std::memcpy(shared.host + 800, tex_scale, sizeof(tex_scale));
   std::memcpy(shared.host + 928, tex_lod, sizeof(tex_lod));
@@ -1097,9 +1100,10 @@ void Draw(uint8_t* base, uint32_t dev, Route route, const DrawCall& call) {
         first += fmt::format(" stream{} {:08X}+{} h{:04X}", st.binding, st.address, st.size,
                              XXH3_64bits(Physical(st.address), std::min<size_t>(st.size, 1 << 20)) & 0xFFFF);
     r.trace = fmt::format("n {} vs {:016X} ps {:016X} kind {} prim {} base {} start {} rt {} ds {} depthctl {:08X} "
-                          "blend {:08X} dev {:08X} idx{}{}",
+                          "blend {:08X} colorctl {:08X} dev {:08X} idx{}{}",
                           call.count, key.vs, key.ps, int(call.kind), call.prim, call.base_vertex, call.start,
-                          static_cast<const void*>(color), static_cast<const void*>(depth), depthctl, key.blend, dev,
+                          static_cast<const void*>(color), static_cast<const void*>(depth), depthctl, key.blend,
+                          colorctl, dev,
                           first, slots_trace);
   }
   r.vs_dirty = g::U64(base, dev);

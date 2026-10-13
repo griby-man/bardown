@@ -2,6 +2,13 @@
 
 What changed, newest first. Dates are when it landed.
 
+## 0.3.1 (2026-10-13)
+
+- **Goal nets are see-through again.** The game draws its nets with the Xbox's alpha-to-mask, which cuts the
+  mesh's holes out of the texture as it draws; the native renderer didn't support it, so every net came out
+  as a solid white sheet. It's now handled (with one sample per pixel it keeps the half-opaque texels and
+  drops the rest), so the ice, the crease and the posts show through the mesh.
+
 ## 0.3.0 (2026-10-12)
 
 - **Windows.** A Windows 10/11 build, `bardown-0.3.0-windows-x64.zip`: unpack it anywhere, put the disc
