@@ -1211,118 +1211,6 @@ index 0000000..a525cee
 +bool WaitExternalFrame(std::chrono::milliseconds limit);
 +
 +}  // namespace rex::ui
-diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
-index 7360ed9..a0059bc 100644
---- a/src/ui/presenter.cpp
-+++ b/src/ui/presenter.cpp
-@@ -11,6 +11,9 @@
- 
- #include <algorithm>
- #include <atomic>
-+#include <chrono>
-+#include <mutex>
-+#include <condition_variable>
- #include <cctype>
- #include <utility>
- 
-@@ -277,6 +280,19 @@ GuestOutputPaintConfig BuildGuestOutputPaintConfigFromCVar() {
- namespace rex {
- namespace ui {
- 
-+namespace {
-+std::atomic<uint64_t> guest_output_refreshes{0};
-+std::atomic<int64_t> guest_output_last_refresh{0};  // steady clock, ns
-+}  // namespace
-+
-+// the game is handing over frames. the ui then repaints with each of them rather than on its own loop, which
-+// on its own clock showed some game frames twice and skipped others, a hitch about once a second
-+static bool GuestOutputLive() {
-+  const int64_t now = std::chrono::steady_clock::now().time_since_epoch().count();
-+  return now - guest_output_last_refresh.load(std::memory_order_relaxed) < 100'000'000;
-+}
-+
-+
- void Presenter::FatalErrorHostGpuLossCallback([[maybe_unused]] bool is_responsible,
-                                               [[maybe_unused]] bool statically_from_ui_thread) {
-   rex::FatalError("Graphics device lost (probably due to an internal error)");
-@@ -537,7 +553,7 @@ void Presenter::PaintFromUIThread(bool force_paint) {
-         (draw_ui && ui_drawers_.empty())) {
-       request_repaint_immediately = true;
-     }
--    if (request_ui_paint_after_current_ui_thread_paint_ && !ui_drawers_.empty()) {
-+    if (request_ui_paint_after_current_ui_thread_paint_ && !ui_drawers_.empty() && !GuestOutputLive()) {
-       request_repaint_at_tick = true;
-     }
-   }
-@@ -546,10 +562,58 @@ void Presenter::PaintFromUIThread(bool force_paint) {
-   }
- }
- 
-+namespace {
-+// set while a renderer other than the gpu emulation owns the picture; only its refreshes get through
-+std::atomic<bool> guest_output_external{false};
-+thread_local bool external_refresh = false;
-+}  // namespace
-+
-+void SetGuestOutputExternal(bool external) { guest_output_external.store(external); }
-+
-+
-+uint64_t GuestOutputRefreshCount() { return guest_output_refreshes.load(std::memory_order_relaxed); }
-+
-+namespace {
-+std::mutex external_frames_mutex;
-+std::condition_variable external_frames_cv;
-+uint64_t external_frames_done = 0, external_frames_taken = 0;
-+}  // namespace
-+
-+void ExternalFrameDone() {
-+  {
-+    std::lock_guard lock(external_frames_mutex);
-+    ++external_frames_done;
-+  }
-+  external_frames_cv.notify_all();
-+}
-+
-+bool WaitExternalFrame(std::chrono::milliseconds limit) {
-+  if (!guest_output_external.load()) return true;
-+  std::unique_lock lock(external_frames_mutex);
-+  if (!external_frames_cv.wait_for(lock, limit, [] { return external_frames_done > external_frames_taken; }))
-+    return false;
-+  ++external_frames_taken;
-+  return true;
-+}
-+
-+bool RefreshGuestOutputExternal(Presenter& presenter, uint32_t frontbuffer_width,
-+                                uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
-+                                uint32_t display_aspect_ratio_y,
-+                                std::function<bool(Presenter::GuestOutputRefreshContext& context)> refresher) {
-+  external_refresh = true;
-+  bool refreshed = presenter.RefreshGuestOutput(frontbuffer_width, frontbuffer_height, display_aspect_ratio_x,
-+                                                display_aspect_ratio_y, std::move(refresher));
-+  external_refresh = false;
-+  return refreshed;
-+}
-+
- bool Presenter::RefreshGuestOutput(
-     uint32_t frontbuffer_width, uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
-     uint32_t display_aspect_ratio_y,
-     std::function<bool(GuestOutputRefreshContext& context)> refresher) {
-+  if (guest_output_external.load(std::memory_order_relaxed) && !external_refresh) {
-+    return false;
-+  }
-   GuestOutputProperties& writable_properties =
-       guest_output_properties_[guest_output_mailbox_writable_];
-   writable_properties.frontbuffer_width = frontbuffer_width;
-@@ -567,6 +631,9 @@ bool Presenter::RefreshGuestOutput(
-       return false;
-     }
-     guest_output_active_last_refresh_ = true;
-+    guest_output_refreshes.fetch_add(1, std::memory_order_relaxed);
-+    guest_output_last_refresh.store(std::chrono::steady_clock::now().time_since_epoch().count(),
-+                                    std::memory_order_relaxed);
-   } else {
-     // Request presenting a blank image if there was a true image previously,
-     // but not now.
 diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
 index 23645ef..a12ee06 100644
 --- a/src/ui/vulkan/vulkan_presenter.cpp
@@ -1409,3 +1297,133 @@ index 23645ef..a12ee06 100644
    switch (present_result) {
      case VK_SUCCESS:
        return PaintResult::kPresented;
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index 7360ed9..964ebef 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -11,6 +11,10 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <chrono>
++#include <thread>
++#include <mutex>
++#include <condition_variable>
+ #include <cctype>
+ #include <utility>
+ 
+@@ -277,6 +281,19 @@ GuestOutputPaintConfig BuildGuestOutputPaintConfigFromCVar() {
+ namespace rex {
+ namespace ui {
+ 
++namespace {
++std::atomic<uint64_t> guest_output_refreshes{0};
++std::atomic<int64_t> guest_output_last_refresh{0};  // steady clock, ns
++}  // namespace
++
++// the game is handing over frames. the ui then repaints with each of them rather than on its own loop, which
++// on its own clock showed some game frames twice and skipped others, a hitch about once a second
++static bool GuestOutputLive() {
++  const int64_t now = std::chrono::steady_clock::now().time_since_epoch().count();
++  return now - guest_output_last_refresh.load(std::memory_order_relaxed) < 100'000'000;
++}
++
++
+ void Presenter::FatalErrorHostGpuLossCallback([[maybe_unused]] bool is_responsible,
+                                               [[maybe_unused]] bool statically_from_ui_thread) {
+   rex::FatalError("Graphics device lost (probably due to an internal error)");
+@@ -537,7 +554,7 @@ void Presenter::PaintFromUIThread(bool force_paint) {
+         (draw_ui && ui_drawers_.empty())) {
+       request_repaint_immediately = true;
+     }
+-    if (request_ui_paint_after_current_ui_thread_paint_ && !ui_drawers_.empty()) {
++    if (request_ui_paint_after_current_ui_thread_paint_ && !ui_drawers_.empty() && !GuestOutputLive()) {
+       request_repaint_at_tick = true;
+     }
+   }
+@@ -546,10 +563,58 @@ void Presenter::PaintFromUIThread(bool force_paint) {
+   }
+ }
+ 
++namespace {
++// set while a renderer other than the gpu emulation owns the picture; only its refreshes get through
++std::atomic<bool> guest_output_external{false};
++thread_local bool external_refresh = false;
++}  // namespace
++
++void SetGuestOutputExternal(bool external) { guest_output_external.store(external); }
++
++
++uint64_t GuestOutputRefreshCount() { return guest_output_refreshes.load(std::memory_order_relaxed); }
++
++namespace {
++std::mutex external_frames_mutex;
++std::condition_variable external_frames_cv;
++uint64_t external_frames_done = 0, external_frames_taken = 0;
++}  // namespace
++
++void ExternalFrameDone() {
++  {
++    std::lock_guard lock(external_frames_mutex);
++    ++external_frames_done;
++  }
++  external_frames_cv.notify_all();
++}
++
++bool WaitExternalFrame(std::chrono::milliseconds limit) {
++  if (!guest_output_external.load()) return true;
++  std::unique_lock lock(external_frames_mutex);
++  if (!external_frames_cv.wait_for(lock, limit, [] { return external_frames_done > external_frames_taken; }))
++    return false;
++  ++external_frames_taken;
++  return true;
++}
++
++bool RefreshGuestOutputExternal(Presenter& presenter, uint32_t frontbuffer_width,
++                                uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
++                                uint32_t display_aspect_ratio_y,
++                                std::function<bool(Presenter::GuestOutputRefreshContext& context)> refresher) {
++  external_refresh = true;
++  bool refreshed = presenter.RefreshGuestOutput(frontbuffer_width, frontbuffer_height, display_aspect_ratio_x,
++                                                display_aspect_ratio_y, std::move(refresher));
++  external_refresh = false;
++  return refreshed;
++}
++
+ bool Presenter::RefreshGuestOutput(
+     uint32_t frontbuffer_width, uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
+     uint32_t display_aspect_ratio_y,
+     std::function<bool(GuestOutputRefreshContext& context)> refresher) {
++  if (guest_output_external.load(std::memory_order_relaxed) && !external_refresh) {
++    return false;
++  }
+   GuestOutputProperties& writable_properties =
+       guest_output_properties_[guest_output_mailbox_writable_];
+   writable_properties.frontbuffer_width = frontbuffer_width;
+@@ -567,6 +632,9 @@ bool Presenter::RefreshGuestOutput(
+       return false;
+     }
+     guest_output_active_last_refresh_ = true;
++    guest_output_refreshes.fetch_add(1, std::memory_order_relaxed);
++    guest_output_last_refresh.store(std::chrono::steady_clock::now().time_since_epoch().count(),
++                                    std::memory_order_relaxed);
+   } else {
+     // Request presenting a blank image if there was a true image previously,
+     // but not now.
+@@ -1577,6 +1645,16 @@ void Presenter::UpdateUITicksNeededFromUIThread() {
+ }
+ 
+ void Presenter::WaitForUITickFromUIThread() {
++#if !REX_PLATFORM_WIN32
++  // no vblank ticks here: with the game not handing over frames (a loading stall, the first start's shader
++  // translation) the ui would repaint as fast as the gpu allows. about 120 a second is plenty for it
++  if (!GuestOutputLive()) {
++    static auto next = std::chrono::steady_clock::now();
++    const auto now = std::chrono::steady_clock::now();
++    if (next > now) std::this_thread::sleep_until(next);
++    next = std::max(next, now) + std::chrono::microseconds(8333);
++  }
++#endif
+ #if REX_PLATFORM_WIN32
+   if (!AreUITicksNeededFromUIThread()) {
+     return;

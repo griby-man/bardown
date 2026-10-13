@@ -2,7 +2,7 @@
 
 What changed, newest first. Dates are when it landed.
 
-## Unreleased
+## 0.3.2 (2026-10-13)
 
 - **Vsync is on.** The window was shown in Vulkan's immediate mode with nothing pacing it, so it redrew
   thousands of times a second while the game made 60: the GPU sat at full clock (about 200 W on an RTX
@@ -12,8 +12,10 @@ What changed, newest first. Dates are when it landed.
   about once a second a frame was shown twice and the next one skipped: a small stall and jump in
   play. Each game frame is now shown once, as it's made (60 a second in play, 30 in menus and cutscenes,
   as on the Xbox). The log counts any repeated or skipped frames every 10 seconds (`[present]`).
-- **Frame limit** in the settings (Display, `present_frame_limit`) caps the frames a second sent to the
-  screen.
+- **Frame limit** in the settings (Display, `present_frame_limit`): off, 30, 60, 120, 144 or 240 frames a
+  second sent to the screen.
+- When the game isn't sending frames (the first start's shader translation, a loading screen that sticks),
+  the settings overlay redraws about 120 times a second instead of as fast as the GPU allows.
 
 ## 0.3.1 (2026-10-13)
 
