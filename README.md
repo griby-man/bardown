@@ -44,11 +44,10 @@ Not tried yet: Practice, the Tutorials, Tournament Mode, Battle for the Cup, and
 through the trade deadline and the draft. Hockey Ultimate Team, online play and the 2013-14 Moments
 Live downloads needed EA's servers, which are long gone.
 
-Rough edges I know about:
+Known issues:
 
 - a soft "psh" in the audio now and then; not tracked down yet
-- the game's own 30 fps cutscenes stay at 30
-- the goal netting may look plainer than on the Xbox; not compared yet
+- cutscenes run at 30 fps, as they do on the Xbox; gameplay and menus run at 60
 
 ![The opening faceoff](docs/images/faceoff.jpg)
 
