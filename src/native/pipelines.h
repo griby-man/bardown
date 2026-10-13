@@ -43,5 +43,7 @@ struct PipelineKey {
 };
 static_assert(sizeof(PipelineKey) == 208, "PipelineKey has padding, and it's hashed as bytes");
 VkPipeline Pipeline(const PipelineKey& key);
+// pipelines built since the last call, and the time it took
+void TakePipelineBuilds(uint64_t& count, double& ms);
 
 }  // namespace bardown::native

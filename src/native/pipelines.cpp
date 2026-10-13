@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <mutex>
+#include <chrono>
 #include <unordered_map>
 #include <vector>
 
@@ -20,6 +21,8 @@ namespace {
 std::recursive_mutex mutex;
 std::unordered_map<uint64_t, std::unique_ptr<ShaderInfo>> shaders;
 std::unordered_map<uint64_t, VkPipeline> pipelines;
+uint64_t built = 0;  // since the last TakePipelineBuilds
+std::chrono::steady_clock::duration build_time{};
 
 // reads what the stage takes in and gives out, by location, from the SPIR-V itself
 void Reflect(const uint32_t* code, size_t words, ShaderInfo& info) {
@@ -246,11 +249,22 @@ const ShaderInfo* Shader(uint64_t hash) {
   return shaders.emplace(hash, std::move(info)).first->second.get();
 }
 
+void TakePipelineBuilds(uint64_t& count, double& ms) {
+  std::lock_guard lock(mutex);
+  count = built;
+  ms = std::chrono::duration<double, std::milli>(build_time).count();
+  built = 0;
+  build_time = {};
+}
+
 VkPipeline Pipeline(const PipelineKey& key) {
   std::lock_guard lock(mutex);
   const uint64_t hash = XXH3_64bits(&key, sizeof(key));
   if (auto it = pipelines.find(hash); it != pipelines.end()) return it->second;
+  const auto start = std::chrono::steady_clock::now();
   VkPipeline pipeline = Make(key);
+  ++built;
+  build_time += std::chrono::steady_clock::now() - start;
   if (!pipeline) REXLOG_WARN("[native] couldn't build a pipeline for shaders {:016X} {:016X}", key.vs, key.ps);
   pipelines.emplace(hash, pipeline);
   return pipeline;

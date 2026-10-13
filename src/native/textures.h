@@ -18,6 +18,8 @@ void TexturesInit(rex::memory::Memory* memory);
 void TextureTrace(bool on);
 // textures loaded from guest memory so far
 uint64_t TextureLoads();
+// time spent loading textures since the last call
+double TakeTextureLoadTime();
 
 struct TextureBinding {
   Heap heap = Heap::k2D;

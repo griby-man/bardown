@@ -1,6 +1,7 @@
 #include "textures.h"
 
 #include <atomic>
+#include <chrono>
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -152,6 +153,7 @@ struct Cache {
   std::atomic<bool> any_written{false};
   bool trace = false;
   uint64_t loads = 0;
+  std::chrono::steady_clock::duration load_time{};
   std::unordered_map<uint32_t, uint32_t> reloads;  // by base
   uint64_t late_changed = 0;
 };
@@ -404,6 +406,13 @@ uint64_t TextureLoads() {
   return c.loads;
 }
 
+double TakeTextureLoadTime() {
+  std::lock_guard lock(c.mutex);
+  const double ms = std::chrono::duration<double, std::milli>(c.load_time).count();
+  c.load_time = {};
+  return ms;
+}
+
 void TexturesInit(rex::memory::Memory* memory) {
   c.memory = memory;
   memory->RegisterPhysicalMemoryInvalidationCallback(OnWritten, nullptr);
@@ -473,7 +482,9 @@ TextureBinding BindTexture(const uint32_t words[6], bool vertex) {
   }
   // written over again and again: the game fills it for the frame it's drawing, maybe after issuing the draw
   const bool late = vertex || c.reloads[base] >= 3;
+  const auto start = std::chrono::steady_clock::now();
   auto t = Load(fetch, format, late);
+  c.load_time += std::chrono::steady_clock::now() - start;
   if (!t) return out;
   ++c.loads;
   ++c.reloads[base];

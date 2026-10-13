@@ -38,6 +38,7 @@
 
 #include "guest.h"
 #include "native.h"
+#include "pipelines.h"
 #include "render.h"
 #include "streams.h"
 #include "textures.h"
@@ -244,6 +245,8 @@ struct State {
   uint64_t swaps = 0;
   std::chrono::steady_clock::time_point last_swap;
   double last_present = 0, worst_gap = 0, worst_present = 0;
+  uint64_t last_builds = 0, last_loads = 0, prev_loads = 0;  // in the latest drawing step
+  double last_build_ms = 0, last_load_ms = 0;
   uint32_t slow = 0;
 };
 State& Get() {
@@ -314,6 +317,10 @@ extern "C" REX_FUNC(sub_827E8B08) {
       bardown::native::RenderPresent(bardown::native::SwapImage(address));
       rex::ui::ExternalFrameDone();
       present_ms = std::chrono::duration<double, std::milli>(clock::now() - now).count();
+      bardown::native::TakePipelineBuilds(s.last_builds, s.last_build_ms);
+      s.prev_loads = s.last_loads;
+      s.last_loads = bardown::native::TextureLoads();
+      s.last_load_ms = bardown::native::TakeTextureLoadTime();
     }
     s.ready = ready;
   }
@@ -321,6 +328,11 @@ extern "C" REX_FUNC(sub_827E8B08) {
   if (s.last_swap != clock::time_point{}) {
     const double gap = std::chrono::duration<double, std::milli>(now - s.last_swap).count();
     s.slow += gap > 20;
+    // a hitch: what drawing the frame before it did. if that's small, the time went to the game's own work
+    if (gap > 40 && s.ready)
+      REXLOG_INFO("[native] long frame: {:.1f} ms; drawing the one before took {:.1f} ms, building {} pipelines "
+                  "{:.1f} ms and loading {} textures {:.1f} ms",
+                  gap, s.last_present, s.last_builds, s.last_build_ms, s.last_loads - s.prev_loads, s.last_load_ms);
     if (gap > s.worst_gap) {
       s.worst_gap = gap;
       s.worst_present = s.last_present;
