@@ -1279,10 +1279,10 @@ index 8197bb4..5b12a36 100644
    } else {
      if (ext_1_2_KHR_sampler_mirror_clamp_to_edge) {
 diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
-index 23645ef..253bdba 100644
+index 23645ef..eab2dc6 100644
 --- a/src/ui/vulkan/vulkan_presenter.cpp
 +++ b/src/ui/vulkan/vulkan_presenter.cpp
-@@ -11,6 +11,8 @@
+@@ -11,11 +11,15 @@
  
  #include <algorithm>
  #include <atomic>
@@ -1291,24 +1291,38 @@ index 23645ef..253bdba 100644
  #include <cstddef>
  #include <cstdint>
  #include <cmath>
-@@ -58,6 +60,10 @@ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_mailbox, true, "UI/Vulkan",
++#include <cstdlib>
+ #include <cstring>
+ #include <memory>
++#include <string>
+ #include <utility>
+ #include <vector>
+ 
+@@ -58,6 +62,10 @@ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_mailbox, true, "UI/Vulkan",
  REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_fifo_relaxed, true, "UI/Vulkan",
                      "Allow FIFO relaxed present mode");
  
-+REXCVAR_DEFINE_INT32(present_frame_limit, 0, "Display",
-+                     "Most frames a second sent to the window; 0 is no limit beyond vsync")
-+    .range(0, 1000);
++REXCVAR_DEFINE_STRING(present_frame_limit, "off", "Display",
++                      "Most frames a second sent to the window; off is no limit beyond vsync")
++    .allowed({"off", "30", "60", "120", "144", "240"});
 +
  namespace rex {
  namespace ui {
  namespace vulkan {
-@@ -2236,12 +2242,33 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+@@ -2236,12 +2244,40 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
    present_info.pSwapchains = &paint_context_.swapchain;
    present_info.pImageIndices = &swapchain_image_index;
    present_info.pResults = nullptr;
 +  // the frame limit: wait out the rest of this frame's slot. a slot missed by more than one frame starts over
 +  // rather than letting the next ones go out back to back
-+  if (const int32_t limit = REXCVAR_GET(present_frame_limit); limit > 0) {
++  // the setting is text written from the ui thread; this thread keeps its own number, updated on change
++  static std::atomic<int> frame_limit = [] {
++    rex::cvar::RegisterChangeCallback("present_frame_limit", [](std::string_view, std::string_view value) {
++      frame_limit.store(std::atoi(std::string(value).c_str()), std::memory_order_relaxed);
++    });
++    return std::atoi(REXCVAR_GET(present_frame_limit).c_str());
++  }();
++  if (const int limit = frame_limit.load(std::memory_order_relaxed); limit > 0) {
 +    static auto next = std::chrono::steady_clock::now();
 +    const auto slot = std::chrono::nanoseconds(1'000'000'000 / limit);
 +    const auto now = std::chrono::steady_clock::now();

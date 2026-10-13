@@ -20,9 +20,9 @@ or the whole file, to go back to the default.
 - **Vsync** (`vsync_display`): on by default, so frames go to the screen in step with your display.
   Off, they go out as fast as the GPU allows, which on a fast card is thousands a second for a game that
   makes 60. Takes effect on restart.
-- **Frame limit** (`present_frame_limit`): the most frames a second sent to the screen; 0, the default,
-  is no limit beyond vsync. The game itself always runs at its own speed, so a limit of 30 only shows
-  every other frame. Takes effect at once.
+- **Frame limit** (`present_frame_limit`): the most frames a second sent to the screen: off (the
+  default, no limit beyond vsync), 30, 60, 120, 144 or 240. The game makes 60, so 60 matches it; 30
+  shows every other frame. Takes effect at once.
 
 ## NHL 14
 
