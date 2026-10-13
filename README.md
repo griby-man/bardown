@@ -278,6 +278,7 @@ Kept in `sdk/bardown-sdk.patch`:
 - **Settings window**: sized in units of the font, so it opens at a readable size on a 4K screen instead of
   620 pixels wide with the categories cut off.
 - **RenderDoc**: only attached when it's already injected.
+- **Frame limit**: `present_frame_limit`, the most frames a second the window is shown.
 - **For the native renderer**: the Vulkan device features it needs, a way for the program to own the
   window's picture, and the `rexgpu-native` plugin.
 - **For the emulated GPU** (the fallback):

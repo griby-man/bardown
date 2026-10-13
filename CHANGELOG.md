@@ -2,6 +2,15 @@
 
 What changed, newest first. Dates are when it landed.
 
+## Unreleased
+
+- **Vsync is on.** The window was shown in Vulkan's immediate mode with nothing pacing it, so it redrew
+  thousands of times a second while the game made 60: the GPU sat at full clock (about 200 W on an RTX
+  3090 at 4K, with coil whine). Frames now go out in step with the display; the same 4K game draws about
+  10 W over an idle desktop. `vsync_display` turns it off.
+- **Frame limit** in the settings (Display, `present_frame_limit`) caps the frames a second sent to the
+  screen.
+
 ## 0.3.1 (2026-10-13)
 
 - **Goal nets are see-through again.** The game draws its nets with the Xbox's alpha-to-mask, which cuts the

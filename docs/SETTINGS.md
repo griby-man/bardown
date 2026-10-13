@@ -14,7 +14,15 @@ or the whole file, to go back to the default.
   which is slower; its own resolution setting, `resolution_scale`, applies then (2 holds 60, 3 runs in the
   high 40s). Takes effect on restart.
 - **Present effect**: how the drawn picture is stretched to your screen.
-- **Vsync**: on by default.
+
+## Display
+
+- **Vsync** (`vsync_display`): on by default, so frames go to the screen in step with your display.
+  Off, they go out as fast as the GPU allows, which on a fast card is thousands a second for a game that
+  makes 60. Takes effect on restart.
+- **Frame limit** (`present_frame_limit`): the most frames a second sent to the screen; 0, the default,
+  is no limit beyond vsync. The game itself always runs at its own speed, so a limit of 30 only shows
+  every other frame. Takes effect at once.
 
 ## NHL 14
 

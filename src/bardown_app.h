@@ -24,6 +24,8 @@
 
 #include "first_run.h"
 
+REXCVAR_DECLARE(bool, vsync_display);
+
 namespace bardown::native {
 void Start(rex::Runtime* runtime, const std::filesystem::path& folder, const std::filesystem::path& game);
 }
@@ -234,6 +236,14 @@ class BardownApp : public rex::ReXApp {
   void OnConfigureStyle(ImGuiStyle& style, rex::ui::Style& ui_style) override {
     rex::ReXApp::OnConfigureStyle(style, ui_style);
     style.ScaleAllSizes(OverlayScale());
+  }
+
+  // vsync on: frames go to the window in step with the display. the runtime prefers immediate/mailbox, which
+  // with nothing else pacing it redraws thousands of times a second for a game making 60
+  void OnPostInitLogging() override {
+    const char* allow = REXCVAR_GET(vsync_display) ? "false" : "true";
+    rex::cvar::SetFlagByName("vulkan_allow_present_mode_immediate", allow);
+    rex::cvar::SetFlagByName("vulkan_allow_present_mode_mailbox", allow);
   }
 
   // F1 opens the settings, as recompilations usually have it (the runtime's own default is F4); a key the

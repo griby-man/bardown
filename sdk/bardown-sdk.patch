@@ -1278,3 +1278,61 @@ index 8197bb4..5b12a36 100644
      }
    } else {
      if (ext_1_2_KHR_sampler_mirror_clamp_to_edge) {
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index 23645ef..253bdba 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -11,6 +11,8 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <chrono>
++#include <thread>
+ #include <cstddef>
+ #include <cstdint>
+ #include <cmath>
+@@ -58,6 +60,10 @@ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_mailbox, true, "UI/Vulkan",
+ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_fifo_relaxed, true, "UI/Vulkan",
+                     "Allow FIFO relaxed present mode");
+ 
++REXCVAR_DEFINE_INT32(present_frame_limit, 0, "Display",
++                     "Most frames a second sent to the window; 0 is no limit beyond vsync")
++    .range(0, 1000);
++
+ namespace rex {
+ namespace ui {
+ namespace vulkan {
+@@ -2236,12 +2242,33 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+   present_info.pSwapchains = &paint_context_.swapchain;
+   present_info.pImageIndices = &swapchain_image_index;
+   present_info.pResults = nullptr;
++  // the frame limit: wait out the rest of this frame's slot. a slot missed by more than one frame starts over
++  // rather than letting the next ones go out back to back
++  if (const int32_t limit = REXCVAR_GET(present_frame_limit); limit > 0) {
++    static auto next = std::chrono::steady_clock::now();
++    const auto slot = std::chrono::nanoseconds(1'000'000'000 / limit);
++    const auto now = std::chrono::steady_clock::now();
++    if (next > now) std::this_thread::sleep_until(next);
++    next = std::max(next, now - slot) + slot;
++  }
+   VkResult present_result;
+   {
+     const VulkanDevice::Queue::Acquisition queue_acquisition =
+         vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
+     present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
+   }
++  // how often frames reach the window, every 10 s; the game itself makes 60
++  {
++    static uint64_t presents = 0;
++    static auto window_start = std::chrono::steady_clock::now();
++    ++presents;
++    const auto now = std::chrono::steady_clock::now();
++    if (now - window_start >= std::chrono::seconds(10)) {
++      REXLOG_INFO("[present] {:.0f} a second", presents / std::chrono::duration<double>(now - window_start).count());
++      presents = 0;
++      window_start = now;
++    }
++  }
+   switch (present_result) {
+     case VK_SUCCESS:
+       return PaintResult::kPresented;

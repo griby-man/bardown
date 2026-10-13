@@ -62,6 +62,8 @@ REXCVAR_DEFINE_INT32(native_resolution_scale, 2, "GPU/Native",
                      "The native renderer draws at the Xbox's 1280x720 times this")
     .range(1, 3)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(vsync_display, true, "Display", "Send frames to the window in step with the display")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(native_shader_cache, "", "GPU/Native",
                       "The translated shaders (shaders.bin); empty looks beside the settings file");
 
