@@ -2,6 +2,15 @@
 
 What changed, newest first. Dates are when it landed.
 
+## 0.3.3 (2026-10-13)
+
+- **Timers keep time.** The runtime's timer thread waited by spinning, and fired the game's 1,000-a-second timer
+  about half a millisecond late on average, often more than a millisecond. It now sleeps until the next timer is
+  due: about 55 microseconds late on average, never over a millisecond, and a little less CPU.
+- The log says what a long frame spent its time on (any frame over 40 ms: drawing, pipelines built, textures
+  loaded), how often the speakers asked for sound and none was ready (`[audio]`), and how late the timers fire
+  (`[timers]`), every 10 seconds.
+
 ## 0.3.2 (2026-10-13)
 
 - **Vsync is on.** The window was shown in Vulkan's immediate mode with nothing pacing it, so it redrew
