@@ -42,6 +42,7 @@ jobs:
       - name: Patches
         run: |
           git -C third_party/rexglue-sdk apply ../../sdk/bardown-sdk.patch
+          git -C third_party/rexglue-sdk apply ../../sdk/sound-log.patch
           git -C third_party/XenosRecomp apply ../../sdk/xenosrecomp.patch
 
       # pinned to a commit, not a tag a third party can move; and set up before generated/ is decrypted
