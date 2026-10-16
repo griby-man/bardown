@@ -20,6 +20,8 @@
 #include <rex/system/xmemory.h>
 #include <rex/ui/external_output.h>
 #include <rex/ui/renderdoc_api.h>
+// the full RenderDoc header: on macOS the runtime's only declares the struct
+#include <renderdoc_app.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/provider.h>
 
