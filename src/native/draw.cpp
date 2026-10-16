@@ -1354,6 +1354,7 @@ void Resolve(const uint8_t* base, uint32_t dev, uint32_t flags, uint32_t src_rec
 Image* SwapImage(uint32_t front_texture_physical) {
   FlushAllInline();
   Assemble();
+  TexturesFrameDone();
   ++stats.frame;
   {
     // segments linked and never run: the game dropped them

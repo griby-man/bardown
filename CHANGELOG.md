@@ -2,6 +2,12 @@
 
 What changed, newest first. Dates are when it landed.
 
+## 0.3.5 (2026-10-16)
+
+- **No freeze on the jersey screen.** 0.3.4 could drop an image the GPU had drawn (the jersey preview) partway
+  through a frame while that frame still had a copy into it waiting to run, and the graphics driver crashed on it;
+  the game hung on the jersey screen. Dropped images are now kept until no frame can still use them.
+
 ## 0.3.4 (2026-10-16)
 
 - **Sounds start clean.** The game turns on a sound's decoder before handing it any audio, and the runtime

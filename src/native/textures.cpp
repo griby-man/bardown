@@ -160,6 +160,8 @@ struct Cache {
   std::unordered_map<uint32_t, uint32_t> reloads;  // by base
   uint64_t late_changed = 0;
   uint64_t resolved_mismatch = 0;  // binds that found a resolved image declared as another texture
+  uint64_t frame = 0;                // swaps assembled
+  std::vector<std::pair<uint64_t, std::unique_ptr<Texture>>> resolved_dropped;  // by the frame they were dropped in
 };
 Cache c;
 
@@ -181,8 +183,15 @@ void Retire(std::unordered_map<uint64_t, std::unique_ptr<Texture>>::iterator it)
   c.textures.erase(it);
 }
 
+// a resolved image dropped mid-frame can still be the destination of a resolve recorded earlier in this frame (or
+// by a worker a frame ahead), replayed at the swap: it's kept whole until those frames are assembled
 void RetireResolved(std::unordered_map<uint32_t, std::unique_ptr<Texture>>::iterator it) {
-  Texture& t = *it->second;
+  c.resolved_dropped.emplace_back(c.frame, std::move(it->second));
+  c.resolved.erase(it);
+}
+
+void FreeResolved(std::unique_ptr<Texture>& texture) {
+  Texture& t = *texture;
   RetireImage(t.image);
   HeapFree(Heap::k2D, t.index);
   for (auto& [s, v] : t.views) {
@@ -191,7 +200,7 @@ void RetireResolved(std::unordered_map<uint32_t, std::unique_ptr<Texture>>::iter
     RetireImage(view_only);
     HeapFree(Heap::k2D, v.second);
   }
-  c.resolved.erase(it);
+  texture.reset();
 }
 
 // drops every texture whose data the CPU wrote over
@@ -437,6 +446,15 @@ std::unique_ptr<Texture> Load(const xenos::xe_gpu_texture_fetch_t& fetch, const 
 }  // namespace
 
 void TextureTrace(bool on) { c.trace = on; }
+
+void TexturesFrameDone() {
+  std::lock_guard lock(c.mutex);
+  ++c.frame;
+  auto& dropped = c.resolved_dropped;
+  auto keep = std::partition(dropped.begin(), dropped.end(), [](const auto& d) { return d.first + 2 >= c.frame; });
+  for (auto it = keep; it != dropped.end(); ++it) FreeResolved(it->second);
+  dropped.erase(keep, dropped.end());
+}
 
 uint32_t PointSampler() {
   std::lock_guard lock(c.mutex);

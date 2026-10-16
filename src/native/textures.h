@@ -16,6 +16,8 @@ namespace bardown::native {
 void TexturesInit(rex::memory::Memory* memory);
 // logs every bind while on (BARDOWN_NATIVE_TRACE)
 void TextureTrace(bool on);
+// after each frame is assembled: frees resolved images dropped two frames ago
+void TexturesFrameDone();
 // textures loaded from guest memory so far
 uint64_t TextureLoads();
 // time spent loading textures since the last call
