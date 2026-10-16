@@ -15,6 +15,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <rex/cvar.h>
@@ -672,6 +673,21 @@ bool AlsoEmulated(const uint8_t* base, uint32_t dev, bool draw) {
   return it != composing.target.end() && it->second == color_info;
 }
 
+// a destination the CPU read a composition from once is read back every time: the game resolves some of them
+// again without drawing a new composition first
+struct {
+  std::mutex mutex;
+  std::unordered_set<uint32_t> addresses;
+} read_back;
+void RememberReadBack(uint32_t dest) {
+  std::lock_guard lock(read_back.mutex);
+  read_back.addresses.insert(dest);
+}
+bool ReadBefore(uint32_t dest) {
+  std::lock_guard lock(read_back.mutex);
+  return read_back.addresses.count(dest) != 0;
+}
+
 void ResolvedOut(uint32_t dev) {
   std::lock_guard lock(composing.mutex);
   composing.target.erase(dev);
@@ -1046,6 +1062,23 @@ void Draw(uint8_t* base, uint32_t dev, Route route, const DrawCall& call) {
     // slots 16 and up are the vertex shaders', which read whole texels (bone matrices) and mustn't blend them
     sc[96 + slot] = slot >= 16 ? PointSampler() : b.sampler;
   }
+  // BARDOWN_DUMP_SKINS=<dir>: a draw reading the 1024x1024 DXN head normal map is a player's head; its 512x512
+  // DXT1 textures are that player's skin
+  static const char* skins = std::getenv("BARDOWN_DUMP_SKINS");
+  if (skins && *skins) {
+    bool head = false;
+    std::vector<std::array<uint32_t, 6>> dxt1;
+    for (uint32_t slot = 0; slot < 16; ++slot) {
+      std::array<uint32_t, 6> w;
+      for (int i = 0; i < 6; ++i) w[i] = g::U32(base, dev + g::kFetch + 24 * slot + 4 * i);
+      if ((w[0] & 3) != 2) continue;
+      const uint32_t fmt = w[1] & 0x3F, tw = (w[2] & 0x1FFF) + 1, th = (w[2] >> 13 & 0x1FFF) + 1;
+      if (fmt == 49 && tw == 1024 && th == 1024) head = true;
+      if (fmt == 18 && tw == 512 && th == 512) dxt1.push_back(w);
+    }
+    if (head)
+      for (const auto& w : dxt1) DumpDXT1(w.data(), skins);
+  }
   const uint32_t bools0 = g::U32(base, dev + g::kBoolConsts), bools4 = g::U32(base, dev + g::kBoolConsts + 16);
   sc[128] = (bools0 & 0xFFFF) | (bools4 & 0xFFFF) << 16;
   // the 360 put pixel centres on whole coordinates; half a pixel over lines them up with Vulkan's
@@ -1262,7 +1295,7 @@ namespace {
 // far runs now, the image comes back, and goes into guest memory as the 360 would have left it there, at 1x,
 // in the destination header's channel order, byte order and tiling, before the game's next call
 void WriteBack(const uint32_t words[6], uint32_t address, uint32_t tex_w, uint32_t tex_h, uint32_t scale,
-               Image& image) {
+               Image& image, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1) {
   if ((words[1] & 0x3F) != 6) {
     static bool told = false;
     if (!told) REXLOG_WARN("[native] a resolve read back by the CPU into format {} isn't handled", words[1] & 0x3F);
@@ -1276,8 +1309,9 @@ void WriteBack(const uint32_t words[6], uint32_t address, uint32_t tex_w, uint32
   const uint32_t pitch = ((words[0] >> 22) & 0x1FF) * 32, endian = (words[1] >> 6) & 3;
   const uint32_t swizzle = (words[3] >> 1) & 0xFFF;
   uint8_t* dst = Physical(address);
-  for (uint32_t y = 0; y < tex_h; ++y)
-    for (uint32_t x = 0; x < tex_w; ++x) {
+  // only what the resolve copied: the 360 leaves the rest of the texture alone, and the game keeps other data there
+  for (uint32_t y = y0; y < std::min(y1, tex_h); ++y)
+    for (uint32_t x = x0; x < std::min(x1, tex_w); ++x) {
       uint32_t sum[4] = {};
       for (uint32_t sy = 0; sy < scale; ++sy)
         for (uint32_t sx = 0; sx < scale; ++sx) {
@@ -1345,7 +1379,16 @@ void Resolve(const uint8_t* base, uint32_t dev, uint32_t flags, uint32_t src_rec
   r.copy.dstOffset = {clamp(dx * int32_t(s), dst->width), clamp(dy * int32_t(s), dst->height), 0};
   r.copy.extent = {w, h, 1};
   frame_entries.push_back({false, r, {}});
-  if (to_memory) WriteBack(words, address, tex_w, tex_h, s, *dst);
+  static const bool verify = std::getenv("BARDOWN_NATIVE_VERIFY") != nullptr;
+  if (verify) {
+    static int told = 0;
+    if (!(tex_w == 1280 && tex_h == 720) && !(tex_w == 320 && tex_h == 380) && told < 2000 && ++told)
+      REXLOG_INFO("[native] resolve {:08X} {}x{} fmt {} rect {} {} {} {} to {} {}: {}", address, tex_w, tex_h,
+                  words[1] & 0x3F, x0, y0, x1, y1, dx, dy, to_memory ? "copied to memory" : "gpu only");
+  }
+  if (to_memory)
+    WriteBack(words, address, tex_w, tex_h, s, *dst, uint32_t(clamp(dx, tex_w)), uint32_t(clamp(dy, tex_h)),
+              uint32_t(clamp(dx + (x1 - x0), tex_w)), uint32_t(clamp(dy + (y1 - y0), tex_h)));
 }
 
 
@@ -1481,7 +1524,14 @@ extern "C" REX_FUNC(sub_827E6760) {
     const float z = float(ctx.f1.f64);
     // native only: the emulated GPU has drawn nothing to copy out, unless it drew a composition. with the
     // emulated GPU gone (the native plugin) the composition is copied out natively instead
-    const bool compose = NativeOnly() && AlsoEmulated(base, dev, false);
+    const uint32_t dest = texture ? g::PhysicalAddress(g::U32(base, texture + 32) & 0xFFFFF000u) : 0;
+    bool compose = false;
+    if (NativeOnly() && AlsoEmulated(base, dev, false)) {
+      compose = true;
+      if (dest) RememberReadBack(dest);
+    } else if (NativeOnly() && dest) {
+      compose = ReadBefore(dest);
+    }
     if (!NativeOnly() || (compose && !NullGpu())) __imp__sub_827E6760(ctx, base);
     if (compose) ResolvedOut(dev);
     Resolve(base, dev, flags, rect, texture, point, compose && NullGpu());

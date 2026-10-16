@@ -2,6 +2,14 @@
 
 What changed, newest first. Dates are when it landed.
 
+## 0.3.6 (2026-10-16)
+
+- **Faces right after a jersey change.** The game builds team gear on the GPU and has the CPU pack it into
+  textures; the renderer copies those GPU results into memory for it. When the game built into the same spot a
+  second time, that copy was skipped, so the CPU packed leftover gear into a player's face texture: a jersey or
+  glove pattern where a face should be. Every later build to a spot the CPU reads is copied now, and a copy only
+  writes the area the game asked for, as on the Xbox.
+
 ## 0.3.5 (2026-10-16)
 
 - **No freeze on the jersey screen.** 0.3.4 could drop an image the GPU had drawn (the jersey preview) partway

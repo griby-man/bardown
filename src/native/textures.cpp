@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <algorithm>
+#include <unordered_set>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -138,6 +139,7 @@ struct Texture {
   // a resolved image: the texture the game declared for it (guest size and format), to tell when a later bind at
   // the same address is something else the game has since put there
   uint32_t guest_w = 0, guest_h = 0, guest_format = 0;
+  uint64_t resolved_frame = 0;  // the swap it was last resolved in
   xenos::xe_gpu_texture_fetch_t fetch = {};
   Format format = {};
 };
@@ -519,6 +521,12 @@ TextureBinding BindTexture(const uint32_t words[6], bool vertex) {
     // through its own swizzle; the image holds the target as it was, so read through the difference. the
     // same swizzle (the usual case) is the image as it is
     Texture& t = *it->second;
+    if (verify && c.frame > t.resolved_frame + 120) {
+      static std::unordered_map<uint32_t, uint64_t> told;
+      if (told[base]++ == 0)
+        REXLOG_INFO("[native] old resolved image bound: {:08X} {}x{} format {}, resolved {} frames ago", base,
+                    t.guest_w, t.guest_h, t.guest_format, c.frame - t.resolved_frame);
+    }
     const uint32_t swizzle = fetch.swizzle;
     if (swizzle == t.dest_swizzle || Aspect(t.image.format) != VK_IMAGE_ASPECT_COLOR_BIT) {
       out.index = t.index;
@@ -594,6 +602,68 @@ void RefreshLate(uint64_t key) {
   Fill(t, false);
 }
 
+bool FirstDump(uint64_t key) {
+  static std::mutex mutex;
+  static std::unordered_set<uint64_t> seen;
+  std::lock_guard lock(mutex);
+  return seen.insert(key).second;
+}
+
+// BARDOWN_DUMP_SKINS: the base level of a DXT1 texture as it is in guest memory now, untiled, as a .dds file
+// named by address and content hash; each (address, content) once
+void DumpDXT1(const uint32_t words[6], const char* dir) {
+  xenos::xe_gpu_texture_fetch_t fetch;
+  std::memcpy(&fetch, words, sizeof(fetch));
+  TextureInfo info;
+  if (!TextureInfo::Prepare(fetch, &info) || info.format != xenos::TextureFormat::k_DXT1) return;
+  namespace tu = rex::graphics::texture_util;
+  const uint32_t width = info.width + 1, height = info.height + 1;
+  const auto layout = tu::GetGuestTextureLayout(info.dimension, fetch.pitch, width, height, 1, info.is_tiled,
+                                                info.format, fetch.packed_mips, true, 0);
+  const FormatInfo* fi = info.format_info();
+  const uint32_t bx = (width + 3) / 4, by = (height + 3) / 4;
+  std::vector<uint8_t> data(size_t(bx) * by * 8);
+  const uint32_t address = fetch.base_address << 12;
+  const uint8_t* src = Physical(address);
+  const auto endian = info.endianness;
+  if (info.is_tiled) {
+    rex::graphics::texture_conversion::UntileInfo untile = {};
+    untile.width = bx;
+    untile.height = by;
+    untile.input_pitch = layout.base.row_pitch_bytes / 8;
+    untile.output_pitch = bx;
+    untile.input_format_info = fi;
+    untile.output_format_info = fi;
+    untile.copy_callback = [endian](void* out, const void* in, size_t n) {
+      rex::graphics::texture_conversion::CopySwapBlock(endian, out, in, n);
+    };
+    rex::graphics::texture_conversion::Untile(data.data(), src, &untile);
+  } else {
+    for (uint32_t y = 0; y < by; ++y)
+      rex::graphics::texture_conversion::CopySwapBlock(endian, data.data() + size_t(y) * bx * 8,
+                                                       src + size_t(y) * layout.base.row_pitch_bytes, size_t(bx) * 8);
+  }
+  const uint64_t hash = XXH3_64bits(data.data(), data.size());
+  if (!FirstDump(hash ^ address)) return;
+  const std::string path = fmt::format("{}/{:08X}_{:016X}.dds", dir, address, hash);
+  std::FILE* f = std::fopen(path.c_str(), "wb");
+  if (!f) return;
+  uint32_t head[32] = {};
+  head[0] = 0x20534444;  // "DDS "
+  head[1] = 124;
+  head[2] = 0x1 | 0x2 | 0x4 | 0x1000 | 0x80000;
+  head[3] = height;
+  head[4] = width;
+  head[5] = uint32_t(data.size());
+  head[19] = 32;
+  head[20] = 0x4;
+  head[21] = 0x31545844;  // "DXT1"
+  head[27] = 0x1000;
+  std::fwrite(head, 4, 32, f);
+  std::fwrite(data.data(), 1, data.size(), f);
+  std::fclose(f);
+}
+
 uint64_t CheckStale() {
   if (!verify) return 0;
   std::lock_guard lock(c.mutex);
@@ -654,6 +724,7 @@ Image* ResolveTexture(uint32_t physical_address, uint32_t width, uint32_t height
     Texture& slot = *it->second;
     if (slot.image.width == width && slot.image.height == height && slot.image.format == format) {
       slot.dest_swizzle = dest_swizzle;
+      slot.resolved_frame = c.frame;
       watch(slot);
       return &slot.image;
     }
@@ -669,6 +740,7 @@ Image* ResolveTexture(uint32_t physical_address, uint32_t width, uint32_t height
   }
   slot->index = HeapAdd(Heap::k2D, slot->image.view);
   slot->dest_swizzle = dest_swizzle;
+  slot->resolved_frame = c.frame;
   watch(*slot);
   return &slot->image;
 }

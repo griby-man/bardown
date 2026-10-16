@@ -18,6 +18,8 @@ void TexturesInit(rex::memory::Memory* memory);
 void TextureTrace(bool on);
 // after each frame is assembled: frees resolved images dropped two frames ago
 void TexturesFrameDone();
+// BARDOWN_DUMP_SKINS: a DXT1 texture as guest memory holds it now, to <dir> as .dds (once per address and content)
+void DumpDXT1(const uint32_t words[6], const char* dir);
 // textures loaded from guest memory so far
 uint64_t TextureLoads();
 // time spent loading textures since the last call
