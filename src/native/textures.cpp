@@ -135,6 +135,9 @@ struct Texture {
   std::vector<std::pair<uint32_t, std::pair<VkImageView, uint32_t>>> views;
   uint64_t hash = 0;
   uint64_t refreshed = UINT64_MAX;  // the frame it was last read again for
+  // a resolved image: the texture the game declared for it (guest size and format), to tell when a later bind at
+  // the same address is something else the game has since put there
+  uint32_t guest_w = 0, guest_h = 0, guest_format = 0;
   xenos::xe_gpu_texture_fetch_t fetch = {};
   Format format = {};
 };
@@ -156,6 +159,7 @@ struct Cache {
   std::chrono::steady_clock::duration load_time{};
   std::unordered_map<uint32_t, uint32_t> reloads;  // by base
   uint64_t late_changed = 0;
+  uint64_t resolved_mismatch = 0;  // binds that found a resolved image declared as another texture
 };
 Cache c;
 
@@ -165,13 +169,29 @@ std::pair<uint32_t, uint32_t> OnWritten(void*, uint32_t start, uint32_t length, 
     c.written.emplace_back(start, length);
   }
   c.any_written.store(true, std::memory_order_release);
-  return {0, UINT32_MAX};
+  // only the pages written stop being watched. "anything" let the runtime unwatch up to 4 MB around them while just
+  // the textures on those pages were dropped, so the rest kept a stale copy and lost their watch: later loads into
+  // that memory (portraits, faces) went unseen
+  return {start, length};
 }
 
 void Retire(std::unordered_map<uint64_t, std::unique_ptr<Texture>>::iterator it) {
   RetireImage(it->second->image);
   HeapFree(it->second->heap, it->second->index);
   c.textures.erase(it);
+}
+
+void RetireResolved(std::unordered_map<uint32_t, std::unique_ptr<Texture>>::iterator it) {
+  Texture& t = *it->second;
+  RetireImage(t.image);
+  HeapFree(Heap::k2D, t.index);
+  for (auto& [s, v] : t.views) {
+    Image view_only;
+    view_only.view = v.first;
+    RetireImage(view_only);
+    HeapFree(Heap::k2D, v.second);
+  }
+  c.resolved.erase(it);
 }
 
 // drops every texture whose data the CPU wrote over
@@ -185,7 +205,8 @@ void DropWritten() {
   for (auto it = c.textures.begin(); it != c.textures.end();) {
     const Texture& t = *it->second;
     const bool hit = !t.late && std::any_of(written.begin(), written.end(), [&](const auto& w) {
-      return t.base < w.first + w.second && w.first < t.base + t.size;
+      return (t.base < w.first + w.second && w.first < t.base + t.size) ||
+             (t.mip_size && t.mip_base < w.first + w.second && w.first < t.mip_base + t.mip_size);
     });
     if (hit) {
       auto next = std::next(it);
@@ -194,6 +215,16 @@ void DropWritten() {
     } else {
       ++it;
     }
+  }
+  // a resolved image is what the GPU left there; once the CPU writes over it, memory holds something else
+  for (auto it = c.resolved.begin(); it != c.resolved.end();) {
+    const Texture& t = *it->second;
+    const bool hit = t.size && std::any_of(written.begin(), written.end(), [&](const auto& w) {
+      return t.base < w.first + w.second && w.first < t.base + t.size;
+    });
+    auto next = std::next(it);
+    if (hit) RetireResolved(it);
+    it = next;
   }
 }
 
@@ -253,6 +284,10 @@ uint32_t SamplerFor(const xenos::xe_gpu_texture_fetch_t& f) {
   return index;
 }
 
+// BARDOWN_NATIVE_VERIFY: textures held from guest memory that changed there without a write notice, i.e. drawn
+// stale. checked from the swap every 600 frames; the hash is taken at load only when this is on
+const bool verify = std::getenv("BARDOWN_NATIVE_VERIFY") != nullptr;
+
 uint64_t GuestHash(const Texture& t) {
   uint64_t hash = XXH3_64bits(Physical(t.base), t.size);
   if (t.mip_size) hash ^= XXH3_64bits(Physical(t.mip_base), t.mip_size) * 0x9E3779B97F4A7C15ull;
@@ -261,6 +296,23 @@ uint64_t GuestHash(const Texture& t) {
 
 // copies a texture out of guest memory, every mip level and, for a cube, every face, untiled and in host byte
 // order, and has it uploaded: into a new image, or over the one a late texture already has
+// the guest memory a texture's base level occupies, worked out the way Fill does
+bool GuestRange(const xenos::xe_gpu_texture_fetch_t& fetch, uint32_t& base, uint32_t& size) {
+  TextureInfo info;
+  if (!TextureInfo::Prepare(fetch, &info)) return false;
+  const bool cube = info.dimension == xenos::DataDimension::kCube;
+  namespace tu = rex::graphics::texture_util;
+  uint32_t base_page, mip_page, min_level, max_level;
+  tu::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr, &base_page, &mip_page, &min_level,
+                                       &max_level);
+  if (!base_page) return false;
+  const auto layout = tu::GetGuestTextureLayout(info.dimension, fetch.pitch, info.width + 1, info.height + 1,
+                                                cube ? 6 : 1, info.is_tiled, info.format, fetch.packed_mips, true, 0);
+  base = base_page << 12;
+  size = layout.base.level_data_extent_bytes;
+  return size != 0;
+}
+
 bool Fill(Texture& t, bool create) {
   const xenos::xe_gpu_texture_fetch_t& fetch = t.fetch;
   const Format& format = t.format;
@@ -373,9 +425,8 @@ std::unique_ptr<Texture> Load(const xenos::xe_gpu_texture_fetch_t& fetch, const 
   // small linear textures are data the game rewrites in place (the crowd's animation palettes), and a write the
   // watch misses would leave a stale copy for good: those are checked against memory every frame they're used
   t->late = late || (!fetch.tiled && t->size + t->mip_size <= 256 * 1024);
-  if (t->late) {
-    t->hash = GuestHash(*t);
-  } else if (c.memory) {
+  if (t->late || verify) t->hash = GuestHash(*t);
+  if (!t->late && c.memory) {
     // tell us when the CPU writes it again
     c.memory->EnablePhysicalMemoryAccessCallbacks(t->base, t->size, true, false);
     if (t->mip_size) c.memory->EnablePhysicalMemoryAccessCallbacks(t->mip_base, t->mip_size, true, false);
@@ -431,6 +482,20 @@ TextureBinding BindTexture(const uint32_t words[6], bool vertex) {
   if (c.trace)
     REXLOG_INFO("[trace] bind {:08X} fmt {} {}x{} resolved {}", base, uint32_t(fetch.format), fetch.size_2d.width + 1,
                 fetch.size_2d.height + 1, c.resolved.count(base));
+  if (auto it = c.resolved.find(base); it != c.resolved.end()) {
+    {
+      const Texture& r = *it->second;
+      const uint32_t w = fetch.size_2d.width + 1, h = fetch.size_2d.height + 1, f = uint32_t(fetch.format);
+      if (r.guest_w && (w != r.guest_w || h != r.guest_h || f != r.guest_format)) {
+        ++c.resolved_mismatch;
+        static int logged = 0;
+        if (logged < 20 && ++logged)
+          REXLOG_INFO("[native] bind at resolved {:08X}: asks {}x{} format {}, resolved as {}x{} format {}; "
+                      "reading memory instead", base, w, h, f, r.guest_w, r.guest_h, r.guest_format);
+        RetireResolved(it);
+      }
+    }
+  }
   if (auto it = c.resolved.find(base); it != c.resolved.end()) {
     // the 360 wrote the target in the destination header's channel order and this fetch reads that memory
     // through its own swizzle; the image holds the target as it was, so read through the difference. the
@@ -511,6 +576,23 @@ void RefreshLate(uint64_t key) {
   Fill(t, false);
 }
 
+uint64_t CheckStale() {
+  if (!verify) return 0;
+  std::lock_guard lock(c.mutex);
+  DropWritten();
+  uint64_t stale = 0;
+  for (auto& [key, texture] : c.textures) {
+    Texture& t = *texture;
+    if (t.late || !t.hash || GuestHash(t) == t.hash) continue;
+    if (++stale <= 8)
+      REXLOG_INFO("[native] stale texture {:08X} ({} bytes, mips {:08X} {} bytes) format {} {}x{}", t.base, t.size,
+                  t.mip_base, t.mip_size, uint32_t(t.fetch.format), t.fetch.size_2d.width + 1,
+                  t.fetch.size_2d.height + 1);
+    t.hash = GuestHash(t);  // counted once
+  }
+  return stale;
+}
+
 uint64_t TakeLateChanges() {
   std::lock_guard lock(c.mutex);
   const uint64_t changed = c.late_changed;
@@ -520,6 +602,7 @@ uint64_t TakeLateChanges() {
 
 void TextureWritten(uint32_t physical_address) {
   std::lock_guard lock(c.mutex);
+  if (auto r = c.resolved.find(physical_address & 0x1FFFF000u); r != c.resolved.end()) RetireResolved(r);
   auto it = c.by_base.find(physical_address & 0x1FFFF000u);
   if (it == c.by_base.end()) return;
   for (uint64_t key : it->second) {
@@ -530,23 +613,35 @@ void TextureWritten(uint32_t physical_address) {
 }
 
 Image* ResolveTexture(uint32_t physical_address, uint32_t width, uint32_t height, VkFormat format,
-                      uint32_t dest_swizzle) {
+                      const uint32_t dest_words[6]) {
   std::lock_guard lock(c.mutex);
-  auto& slot = c.resolved[physical_address & 0x1FFFF000u];
-  if (slot && slot->image.width == width && slot->image.height == height && slot->image.format == format) {
-    slot->dest_swizzle = dest_swizzle;
-    return &slot->image;
+  DropWritten();
+  const uint32_t address = physical_address & 0x1FFFF000u;
+  xenos::xe_gpu_texture_fetch_t dest;
+  std::memcpy(&dest, dest_words, sizeof(dest));
+  const uint32_t dest_swizzle = dest.swizzle;
+  // a texture loaded from here earlier is what the CPU put there before the GPU wrote this over it
+  if (auto loaded = c.by_base.find(address); loaded != c.by_base.end()) {
+    for (uint64_t key : loaded->second)
+      if (auto t = c.textures.find(key); t != c.textures.end()) Retire(t);
+    c.by_base.erase(loaded);
   }
-  if (slot) {
-    RetireImage(slot->image);
-    HeapFree(Heap::k2D, slot->index);
-    for (auto& [s, v] : slot->views) {
-      Image view_only;
-      view_only.view = v.first;
-      RetireImage(view_only);
-      HeapFree(Heap::k2D, v.second);
+  const auto watch = [&](Texture& t) {
+    t.guest_w = dest.size_2d.width + 1, t.guest_h = dest.size_2d.height + 1, t.guest_format = uint32_t(dest.format);
+    // the CPU writing here later means the game has put something else in this memory
+    if (GuestRange(dest, t.base, t.size) && c.memory)
+      c.memory->EnablePhysicalMemoryAccessCallbacks(t.base, t.size, true, false);
+  };
+  if (auto it = c.resolved.find(address); it != c.resolved.end()) {
+    Texture& slot = *it->second;
+    if (slot.image.width == width && slot.image.height == height && slot.image.format == format) {
+      slot.dest_swizzle = dest_swizzle;
+      watch(slot);
+      return &slot.image;
     }
+    RetireResolved(it);
   }
+  auto& slot = c.resolved[address];
   REXLOG_INFO("[native] resolve target {:08X} {}x{} format {}", physical_address, width, height, int(format));
   slot = std::make_unique<Texture>();
   if (!MakeImage(slot->image, width, height, format,
@@ -555,8 +650,8 @@ Image* ResolveTexture(uint32_t physical_address, uint32_t width, uint32_t height
     return nullptr;
   }
   slot->index = HeapAdd(Heap::k2D, slot->image.view);
-  slot->base = physical_address;
   slot->dest_swizzle = dest_swizzle;
+  watch(*slot);
   return &slot->image;
 }
 

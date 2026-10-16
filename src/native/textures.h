@@ -40,6 +40,8 @@ uint32_t PointSampler();
 void RefreshLate(uint64_t key);
 // late textures found changed at the swap since the last call
 uint64_t TakeLateChanges();
+// textures that changed in guest memory without a write notice (BARDOWN_NATIVE_VERIFY), logged
+uint64_t CheckStale();
 
 // a texture the game writes with the CPU, by the address of its data: the native copy is dropped
 void TextureWritten(uint32_t physical_address);
@@ -47,7 +49,7 @@ void TextureWritten(uint32_t physical_address);
 // a render target copied into a texture by a resolve: later binds of that address use this image
 // dest_swizzle: the destination header's swizzle, the channel order the 360 wrote it in
 Image* ResolveTexture(uint32_t physical_address, uint32_t width, uint32_t height, VkFormat format,
-                      uint32_t dest_swizzle);
+                      const uint32_t dest_words[6]);
 // the image a resolve left at that address, if any
 Image* ResolvedImage(uint32_t physical_address);
 

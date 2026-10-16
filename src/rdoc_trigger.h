@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstdlib>
 #include <string>
 #include <thread>
@@ -17,34 +18,49 @@
 
 namespace bardown {
 
+#if defined(__linux__)
+// the injected renderdoc's api, or null when it isn't loaded
+inline RENDERDOC_API_1_0_0* RenderDocApi() {
+  static RENDERDOC_API_1_0_0* api = [] {
+    RENDERDOC_API_1_0_0* found = nullptr;
+    void* mod = dlopen("librenderdoc.so", RTLD_NOW | RTLD_NOLOAD);
+    auto get_api = mod ? reinterpret_cast<pRENDERDOC_GetAPI>(dlsym(mod, "RENDERDOC_GetAPI")) : nullptr;
+    if (!get_api || !get_api(eRENDERDOC_API_Version_1_0_0, reinterpret_cast<void**>(&found))) found = nullptr;
+    return found;
+  }();
+  return api;
+}
+#endif
+
+// three captures a few frames apart, now (the F11 bind when renderdoc is loaded)
+inline void CaptureRenderDocNow() {
+#if defined(__linux__)
+  RENDERDOC_API_1_0_0* api = RenderDocApi();
+  if (!api) return;
+  std::thread([api] {
+    for (int i = 0; i < 3; ++i) {
+      api->StartFrameCapture(nullptr, nullptr);
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      REXLOG_INFO("[rdoc] capture {} {}", i, api->EndFrameCapture(nullptr, nullptr) ? "written" : "failed");
+      std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    }
+  }).detach();
+#endif
+}
+
 inline void StartRenderDocTrigger() {
 #if defined(__linux__)
   const char* at = std::getenv("BARDOWN_RDOC_AT");
   if (!at || !*at) return;
-  void* mod = dlopen("librenderdoc.so", RTLD_NOW | RTLD_NOLOAD);
-  if (!mod) {
+  if (!RenderDocApi()) {
     REXLOG_WARN("[rdoc] BARDOWN_RDOC_AT set but renderdoc is not loaded");
     return;
   }
-  auto get_api = reinterpret_cast<pRENDERDOC_GetAPI>(dlsym(mod, "RENDERDOC_GetAPI"));
-  RENDERDOC_API_1_0_0* api = nullptr;
-  if (!get_api || !get_api(eRENDERDOC_API_Version_1_0_0, reinterpret_cast<void**>(&api)) || !api) {
-    REXLOG_WARN("[rdoc] RENDERDOC_GetAPI failed");
-    return;
-  }
-  // several captures a second apart, in case one lands on a loading or menu frame
-  double first = std::stod(at);
-  std::thread([api, first] {
+  // the same captures as F11, after the given seconds (explicit start/end with wildcard device+window:
+  // TriggerCapture keys off the active window, which renderdoc doesn't track under wayland)
+  std::thread([first = std::stod(at)] {
     std::this_thread::sleep_for(std::chrono::duration<double>(first));
-    // explicit start/end with wildcard device+window: TriggerCapture keys off the active
-    // window, which renderdoc doesn't track under wayland
-    for (int i = 0; i < 3; ++i) {
-      api->StartFrameCapture(nullptr, nullptr);
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
-      bool ok = api->EndFrameCapture(nullptr, nullptr);
-      REXLOG_INFO("[rdoc] capture {} {}", i, ok ? "written" : "failed");
-      std::this_thread::sleep_for(std::chrono::seconds(1));
-    }
+    CaptureRenderDocNow();
   }).detach();
 #endif
 }

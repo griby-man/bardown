@@ -116,6 +116,16 @@ crowd's instancing) are repeated, so index i reads vertex i mod n as the shader'
   vanishing on alternate frames. Small linear textures and every texture a vertex shader reads are now
   compared with memory each frame. They're compared when the draws that use them are replayed, not when
   they're bound, because the worker threads record a frame ahead of the one being shown.
+- **Textures rewritten in place.** When the game wrote into one page of a texture, the watch was lifted on
+  up to 4 MB around it while only the textures on that page were dropped, so later writes to their
+  neighbours went unseen: black faces, a jersey drawn on a player's face. Only the written pages are
+  unwatched now, and mip levels are checked as well as the base.
+- **Images the GPU drew into memory the game reuses.** A resolved image stayed attached to its address
+  after the game loaded something else there, so replay banners flashed and portraits came out stretched.
+  Resolved images are now watched like loaded textures, and dropped when that memory is written or a
+  texture of a different size or format is bound at the address.
+- **Alpha test.** The translated shaders always tested "alpha at least the reference"; NHL 14 also uses
+  "at most" and "greater". All eight comparisons now follow the game's setting.
 
 **Team gear.** Helmets, gloves and pants are composed on the GPU at load (template textures times team
 colours), resolved to memory, and compressed to DXT by the CPU. With nothing reaching memory, helmets

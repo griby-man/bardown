@@ -2,6 +2,21 @@
 
 What changed, newest first. Dates are when it landed.
 
+## 0.3.4 (2026-10-16)
+
+- **Sounds start clean.** The game turns on a sound's decoder before handing it any audio, and the runtime
+  decoded on the spot, found nothing, and flagged the output buffer. The game reads that flag as "buffer
+  full", so every sound in the game started with 35 ms of whatever that buffer played last, and the real
+  sound came in 35 ms late. On the pause menu that was a random swoosh, loud or silent, on every move. The
+  flag now only clears once the decoder has written something, as on the hardware.
+- **Sounds play to the end.** The decoder held back each sound's last 320 samples, waiting for a frame that
+  never came; the game then busy-waited for them. They're now handed over when the sound runs out of input.
+- **Faces, jerseys and banners.** Textures the game rewrote in place, and images the GPU drew into memory
+  the game later reused, were kept stale: black faces, a jersey drawn on a face, flashing replay banners.
+  Both are now dropped when their memory changes. Alpha test uses the game's comparison (it was always "at
+  least"), which fixes cut-outs drawn inside out; the shader cache is rebuilt on first start.
+- F8 saves the last 10 seconds of sound to the logs folder, for reporting what you heard.
+
 ## 0.3.3 (2026-10-13)
 
 - **Timers keep time.** The runtime's timer thread waited by spinning, and fired the game's 1,000-a-second timer

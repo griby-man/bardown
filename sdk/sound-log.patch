@@ -1,5 +1,5 @@
 diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
-index 11b83be..009ac4e 100644
+index 11b83be..59a4eae 100644
 --- a/src/audio/xma_context.cpp
 +++ b/src/audio/xma_context.cpp
 @@ -10,7 +10,13 @@
@@ -53,7 +53,166 @@ index 11b83be..009ac4e 100644
  using stream::BitStream;
  
  const uint32_t XmaContext::kBitsPerPacketHeader;
-@@ -544,6 +580,8 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+@@ -92,6 +128,33 @@ int XmaContext::Setup(uint32_t id, memory::Memory* memory, uint32_t guest_ptr) {
+   return 0;
+ }
+ 
++// BARDOWN_XMA_TRACE=<file> with BARDOWN_XMA_TRACE_WINDOW=<from>:<to> (seconds since start): one line per decoder
++// call, state change or game call, to see what the game's mixer asks of a context and what it gets back
++static const auto trace_start = std::chrono::steady_clock::now();
++
++void TraceXma(const char* what, uint32_t context, const XMA_CONTEXT_DATA* data, int64_t value) {
++  static const char* path = std::getenv("BARDOWN_XMA_TRACE");
++  if (!path || !*path) return;
++  static double from = 0, to = 0;
++  static FILE* out = [] {
++    if (const char* w = std::getenv("BARDOWN_XMA_TRACE_WINDOW")) std::sscanf(w, "%lf:%lf", &from, &to);
++    return std::fopen(path, "w");
++  }();
++  const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - trace_start).count();
++  if (!out || t < from || (to > 0 && t > to)) return;
++  static std::mutex mutex;
++  std::lock_guard lock(mutex);
++  if (!data) {
++    std::fprintf(out, "%.6f %s %u v%lld\n", t, what, context, static_cast<long long>(value));
++    return;
++  }
++  std::fprintf(out, "%.6f %s %u in%u%u cur%u rd%u loop%u out%u blocks%u r%u w%u pad%u sdc%u err%u\n", t, what,
++               context, data->input_buffer_0_valid, data->input_buffer_1_valid, data->current_buffer,
++               data->input_buffer_read_offset, data->loop_count, data->output_buffer_valid,
++               data->output_buffer_block_count, data->output_buffer_read_offset, data->output_buffer_write_offset,
++               data->output_buffer_padding, data->subframe_decode_count, data->error_status);
++}
++
+ bool XmaContext::Work() {
+   if (!is_allocated() || !is_enabled()) {
+     return false;
+@@ -108,6 +171,7 @@ bool XmaContext::Work() {
+     return true;
+   }
+ 
++  TraceXma("work", id_, &data, 0);
+   memory::RingBuffer output_rb = PrepareOutputRingBuffer(&data);
+ 
+   // Consume-only context: no input, just drain remaining subframes.
+@@ -132,8 +196,25 @@ bool XmaContext::Work() {
+     return true;
+   }
+ 
++  const int32_t free_blocks_before = remaining_subframe_blocks_in_output_buffer_;
++  const bool kicked_without_input = !data.IsAnyInputBufferValid();
+   while (remaining_subframe_blocks_in_output_buffer_ >= minimum_subframe_decode_count) {
+     Decode(&data);
++    if (kicked_without_input && !current_frame_remaining_subframes_ && carry_valid_) {
++      // kicked again with no input left: the last frame's tail is still held back waiting for a next frame that
++      // won't come. the game counts on every sample of the sound and stalls its mixer waiting for these. (not on
++      // the kick that ran the input dry: games hand over the second input buffer a moment after the first)
++      const size_t pad_bytes = kDecoderStartPadding * kBytesPerSample << data.is_stereo;
++      const size_t carry_bytes = (kBytesPerFrameChannel << data.is_stereo) - pad_bytes;
++      std::memcpy(raw_frame_.data(), carry_frame_.data(), carry_bytes);
++      std::memset(raw_frame_.data() + carry_bytes, 0, pad_bytes);
++      current_frame_remaining_subframes_ = 4 << data.is_stereo;
++      loop_frame_output_limit_ = pending_output_limit_;
++      current_frame_remaining_subframes_ -= std::min(pending_start_skip_, current_frame_remaining_subframes_);
++      carry_valid_ = false;
++      tail_flushed_ = true;
++      TraceXma("flush", id_, &data, 0);
++    }
+     Consume(&output_rb, &data);
+ 
+     if (!data.IsAnyInputBufferValid() || data.error_status == 4) {
+@@ -143,16 +224,22 @@ bool XmaContext::Work() {
+ 
+   data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
+ 
+-  if (output_rb.empty()) {
++  // read == write is both empty and full, and the game reads a cleared valid bit there as full. the hardware takes
++  // a while to get to a kick, so a game that enables a context before giving it input never sees it cleared on the
++  // empty buffer; decoding on the spot would, and the game then plays 24 blocks of whatever the buffer last held
++  has_output_ |= remaining_subframe_blocks_in_output_buffer_ < free_blocks_before;
++  if (output_rb.empty() && has_output_) {
+     data.output_buffer_valid = 0;
+   }
+ 
+   StoreContextMerged(data, initial_data, context_ptr);
++  TraceXma("done", id_, &data, 0);
+   return true;
+ }
+ 
+ void XmaContext::Enable() {
+   std::lock_guard<std::mutex> lock(lock_);
++  TraceXma("enable", id_, nullptr, 0);
+   set_is_enabled(true);
+ }
+ 
+@@ -173,6 +260,7 @@ void XmaContext::Clear() {
+ 
+   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
+   XMA_CONTEXT_DATA data(context_ptr);
++  TraceXma("clear", id_, &data, 0);
+   ClearLocked(&data);
+   data.Store(context_ptr);
+ }
+@@ -204,6 +292,8 @@ void XmaContext::ResetDecoderState() {
+   decoded_frame_.fill(0);
+   carry_frame_.fill(0);
+   carry_valid_ = false;
++  has_output_ = false;
++  tail_flushed_ = false;
+   pending_output_limit_ = 0;
+   pending_start_skip_ = 0;
+   current_frame_remaining_subframes_ = 0;
+@@ -213,6 +303,7 @@ void XmaContext::ResetDecoderState() {
+ 
+ void XmaContext::Disable() {
+   std::lock_guard<std::mutex> lock(lock_);
++  TraceXma("disable", id_, nullptr, 0);
+   set_is_enabled(false);
+ }
+ 
+@@ -422,6 +513,32 @@ void XmaContext::StoreContextMerged(const XMA_CONTEXT_DATA& data,
+   fresh.Store(context_ptr);
+ }
+ 
++namespace {
++// BARDOWN_XMA_DUMP=<dir> with BARDOWN_XMA_DUMP_WINDOW=<from>:<to> (seconds since the first decode): everything the
++// decoder hands the game in that window, to <dir>/xma-out.bin as records {u64 ns since first decode, u32 context,
++// u32 bytes, u32 stereo, u32 sample rate} then the bytes (16-bit samples, as written for the guest)
++void DumpOutput(uint32_t context, const XMA_CONTEXT_DATA* data, const uint8_t* bytes, uint32_t size) {
++  static const char* dir = std::getenv("BARDOWN_XMA_DUMP");
++  if (!dir || !*dir || !size) return;
++  static const auto start = std::chrono::steady_clock::now();
++  static double from = 0, to = 0;
++  static FILE* out = [] {
++    if (const char* w = std::getenv("BARDOWN_XMA_DUMP_WINDOW")) std::sscanf(w, "%lf:%lf", &from, &to);
++    return std::fopen((std::string(dir) + "/xma-out.bin").c_str(), "wb");
++  }();
++  const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
++  if (!out || ns < from * 1e9 || (to > 0 && ns > to * 1e9)) return;
++  static std::mutex mutex;
++  std::lock_guard lock(mutex);
++  const uint64_t when = uint64_t(ns);
++  const uint32_t head[4] = {context, size, uint32_t(data->is_stereo), uint32_t(data->sample_rate)};
++  std::fwrite(&when, 8, 1, out);
++  std::fwrite(head, 4, 4, out);
++  std::fwrite(bytes, 1, size, out);
++  std::fflush(out);
++}
++}  // namespace
++
+ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA* data) {
+   if (!current_frame_remaining_subframes_) {
+     return;
+@@ -457,6 +574,8 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA*
+       ((kBytesPerFrameChannel / kOutputBytesPerBlock) << data->is_stereo) -
+       current_frame_remaining_subframes_;
+ 
++  DumpOutput(id_, data, raw_frame_.data() + (kOutputBytesPerBlock * raw_frame_read_offset),
++             subframes_to_write * kOutputBytesPerBlock);
+   output_rb->Write(raw_frame_.data() + (kOutputBytesPerBlock * raw_frame_read_offset),
+                    subframes_to_write * kOutputBytesPerBlock);
+ 
+@@ -544,6 +663,8 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
    }
  
    uint8_t* current_input_buffer = GetCurrentInputBuffer(data);
@@ -62,3 +221,15 @@ index 11b83be..009ac4e 100644
  
    input_buffer_.fill(0);
  
+@@ -689,6 +810,11 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+                                  : 0;
+     loop_start_skip_pending_ = false;
+ 
++    if (tail_flushed_) {
++      // more input after the tail went out: it wasn't the end of the sound after all
++      TraceXma("resumed-after-flush", id_, data, 0);
++      tail_flushed_ = false;
++    }
+     if (carry_valid_) {
+       std::memcpy(raw_frame_.data(), carry_frame_.data(), carry_bytes);
+       std::memcpy(raw_frame_.data() + carry_bytes, decoded_frame_.data(), pad_bytes);

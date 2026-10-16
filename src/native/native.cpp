@@ -77,7 +77,7 @@ namespace bardown::native {
 
 namespace {
 
-// shaders.bin, written by XenosRecomp from the disc: "BDSC", version 6, count, then per shader {u64 hash of
+// shaders.bin, written by XenosRecomp from the disc: "BDSC", version 11, count, then per shader {u64 hash of
 // the guest shader container, u32 offset, u32 size, u32 spec constants mask, u32 0}, then plain SPIR-V
 struct Shader {
   uint32_t offset, size, spec, flags;
@@ -91,7 +91,7 @@ bool LoadShaders(const std::filesystem::path& path, ShaderCache& out) {
   std::ifstream in(path, std::ios::binary);
   if (!in) return false;
   uint32_t head[3];
-  if (!in.read(reinterpret_cast<char*>(head), sizeof(head)) || head[0] != 0x43534442 || head[1] != 10) return false;
+  if (!in.read(reinterpret_cast<char*>(head), sizeof(head)) || head[0] != 0x43534442 || head[1] != 11) return false;
   std::vector<uint8_t> table(size_t(head[2]) * 24);
   if (!in.read(reinterpret_cast<char*>(table.data()), std::streamsize(table.size()))) return false;
   out.spirv.assign(std::istreambuf_iterator<char>(in), {});
@@ -348,6 +348,7 @@ extern "C" REX_FUNC(sub_827E8B08) {
                 "changed by the swap",
                 s.slow, s.worst_gap, s.worst_present, gpu_wait, gpu_worst, bardown::native::TakeStreamChanges(),
                 bardown::native::TakeLateChanges());
+    if (const uint64_t stale = bardown::native::CheckStale()) REXLOG_INFO("[native] {} stale textures", stale);
     s.slow = 0;
     s.worst_gap = 0;
     uint64_t draws = 0, skipped = 0;

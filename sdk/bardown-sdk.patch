@@ -10,6 +10,65 @@ index d9a64eb..352de37 100644
          SPIRV glslang MachineIndependent GenericCodeGen OSDependent OGLCompiler  # glslang
          spirv-tools-headers
      )
+diff --git a/include/rex/audio/sdl/sdl_audio_driver.h b/include/rex/audio/sdl/sdl_audio_driver.h
+index f8949ca..641e64b 100644
+--- a/include/rex/audio/sdl/sdl_audio_driver.h
++++ b/include/rex/audio/sdl/sdl_audio_driver.h
+@@ -11,6 +11,7 @@
+ 
+ #pragma once
+ 
++#include <filesystem>
+ #include <mutex>
+ #include <queue>
+ #include <stack>
+@@ -22,6 +23,9 @@
+ 
+ namespace rex::audio::sdl {
+ 
++// the last 10 seconds of mixed sound as a 6-channel float WAV, for reporting a glitch after hearing it
++bool SaveRecentAudio(const std::filesystem::path& path);
++
+ class SDLAudioDriver : public AudioDriver {
+  public:
+   SDLAudioDriver(memory::Memory* memory, rex::thread::Semaphore* semaphore);
+diff --git a/include/rex/audio/xma/context.h b/include/rex/audio/xma/context.h
+index 8426798..3c7aa50 100644
+--- a/include/rex/audio/xma/context.h
++++ b/include/rex/audio/xma/context.h
+@@ -152,6 +152,9 @@ struct XMA_CONTEXT_DATA {
+ };
+ static_assert_size(XMA_CONTEXT_DATA, 64);
+ 
++// debug trace (BARDOWN_XMA_TRACE), data may be null
++void TraceXma(const char* what, uint32_t context, const XMA_CONTEXT_DATA* data, int64_t value);
++
+ #pragma pack(push, 1)
+ // XMA2WAVEFORMATEX
+ struct Xma2ExtraData {
+@@ -304,6 +307,9 @@ class XmaContext {
+   // samples are still being assembled, so they land one decode after the frame
+   // they describe.
+   bool carry_valid_ = false;
++  // output written since the last clear: until then an empty output buffer just means the game hasn't given us input yet
++  bool has_output_ = false;
++  bool tail_flushed_ = false;
+   uint8_t pending_output_limit_ = 0;
+   uint8_t pending_start_skip_ = 0;
+ };
+diff --git a/include/rex/audio/xma/decoder.h b/include/rex/audio/xma/decoder.h
+index df00f06..88d177c 100644
+--- a/include/rex/audio/xma/decoder.h
++++ b/include/rex/audio/xma/decoder.h
+@@ -53,7 +53,7 @@ class XmaDecoder {
+   void Pause();
+   void Resume();
+ 
+- protected:
++ public:
+   int GetContextId(uint32_t guest_ptr);
+ 
+  private:
 diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
 index da8e432..79e0994 100644
 --- a/include/rex/graphics/command_processor.h
@@ -55,6 +114,147 @@ index 1cb3faa..a150134 100644
    std::vector<InputDriver*> device_owners_;
  };
  
+diff --git a/include/rex/ui/external_output.h b/include/rex/ui/external_output.h
+new file mode 100644
+index 0000000..a525cee
+--- /dev/null
++++ b/include/rex/ui/external_output.h
+@@ -0,0 +1,28 @@
++#pragma once
++
++#include <chrono>
++#include <cstdint>
++#include <functional>
++
++#include <rex/ui/presenter.h>
++
++namespace rex::ui {
++
++// lets a renderer outside the gpu emulation own the picture: while set, the emulation's swaps no longer
++// refresh the guest output, and the outside renderer refreshes it through RefreshGuestOutputExternal
++void SetGuestOutputExternal(bool external);
++
++// how many frames the guest output has been given so far
++uint64_t GuestOutputRefreshCount();
++bool RefreshGuestOutputExternal(Presenter& presenter, uint32_t frontbuffer_width,
++                                uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
++                                uint32_t display_aspect_ratio_y,
++                                std::function<bool(Presenter::GuestOutputRefreshContext& context)> refresher);
++
++// the outside renderer has taken a frame's data (called at each of its swaps). a gpu front end that draws
++// nothing holds each swap until then, so fences after it don't tell the game the frame is done before it was
++// read, as the 360's GPU, a frame behind, never did. returns false if the wait ran out
++void ExternalFrameDone();
++bool WaitExternalFrame(std::chrono::milliseconds limit);
++
++}  // namespace rex::ui
+diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
+index 20a2cd8..5987248 100644
+--- a/src/audio/sdl/sdl_audio_driver.cpp
++++ b/src/audio/sdl/sdl_audio_driver.cpp
+@@ -11,7 +11,10 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <cstdio>
+ #include <cstring>
++#include <mutex>
++#include <vector>
+ 
+ #include <rex/assert.h>
+ #include <rex/audio/conversion.h>
+@@ -28,6 +31,62 @@ REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
+ 
+ namespace rex::audio::sdl {
+ 
++namespace {
++// the last 10 seconds of frames as the game submitted them: 6 channels one after another, big-endian floats
++constexpr size_t kRecentChannels = 6, kRecentSamples = 256;
++constexpr size_t kRecentFrames = 48000 * 10 / kRecentSamples;
++struct Recent {
++  std::mutex mutex;
++  std::vector<float> frames;
++  size_t next = 0, count = 0;
++};
++Recent recent;
++
++void KeepRecent(const float* frame) {
++  std::lock_guard lock(recent.mutex);
++  constexpr size_t size = kRecentChannels * kRecentSamples;
++  if (recent.frames.empty()) recent.frames.resize(kRecentFrames * size);
++  std::memcpy(recent.frames.data() + recent.next * size, frame, size * sizeof(float));
++  recent.next = (recent.next + 1) % kRecentFrames;
++  recent.count = std::min(recent.count + 1, kRecentFrames);
++}
++}  // namespace
++
++bool SaveRecentAudio(const std::filesystem::path& path) {
++  std::vector<float> out;
++  {
++    std::lock_guard lock(recent.mutex);
++    constexpr size_t size = kRecentChannels * kRecentSamples;
++    out.reserve(recent.count * size);
++    for (size_t f = 0; f < recent.count; ++f) {
++      const float* frame = recent.frames.data() + ((recent.next + kRecentFrames - recent.count + f) % kRecentFrames) * size;
++      for (size_t s = 0; s < kRecentSamples; ++s)
++        for (size_t c = 0; c < kRecentChannels; ++c) out.push_back(rex::byte_swap(frame[c * kRecentSamples + s]));
++    }
++  }
++  if (out.empty()) return false;
++  std::FILE* file = std::fopen(path.string().c_str(), "wb");
++  if (!file) return false;
++  const uint32_t data_bytes = uint32_t(out.size() * sizeof(float));
++  const uint32_t rate = 48000, channels = kRecentChannels, block = channels * 4;
++  auto put32 = [&](uint32_t v) { std::fwrite(&v, 4, 1, file); };
++  auto put16 = [&](uint16_t v) { std::fwrite(&v, 2, 1, file); };
++  std::fwrite("RIFF", 1, 4, file);
++  put32(36 + data_bytes);
++  std::fwrite("WAVEfmt ", 1, 8, file);
++  put32(16);
++  put16(3);  // IEEE float
++  put16(uint16_t(channels));
++  put32(rate);
++  put32(rate * block);
++  put16(uint16_t(block));
++  put16(32);
++  std::fwrite("data", 1, 4, file);
++  put32(data_bytes);
++  std::fwrite(out.data(), 1, data_bytes, file);
++  return std::fclose(file) == 0;
++}
++
+ SDLAudioDriver::SDLAudioDriver(memory::Memory* memory, rex::thread::Semaphore* semaphore)
+     : AudioDriver(memory), semaphore_(semaphore) {}
+ 
+@@ -123,6 +182,7 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
+   }
+ 
+   std::memcpy(output_frame, input_frame, frame_samples_ * sizeof(float));
++  KeepRecent(output_frame);
+ 
+   static uint32_t sdl_submit_count = 0;
+   if (sdl_submit_count < 10) {
+@@ -178,10 +238,20 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+   const StereoFold fold = GetStereoFold();
+   const SurroundMix mix = GetSurroundMix();
+   const float gain = GetOutputGain();
++  // how often the speakers asked for sound and none was ready (heard as static), every 10 s once playing
++  static uint64_t asked = 0, dry = 0;
++  static auto window_start = std::chrono::steady_clock::now();
++  if (const auto now = std::chrono::steady_clock::now(); now - window_start >= std::chrono::seconds(10)) {
++    if (asked) REXAPU_INFO("[audio] {} frames asked for, {} ran dry", asked, dry);
++    asked = dry = 0;
++    window_start = now;
++  }
+   while (additional_amount > 0) {
+     static uint32_t sdl_callback_count = 0;
+     std::unique_lock<std::mutex> guard(driver->frames_mutex_);
++    ++asked;
+     if (driver->frames_queued_.empty()) {
++      ++dry;
+       if (sdl_callback_count < 10) {
+         REXAPU_DEBUG("SDLCallback: no frames queued (silence)");
+         sdl_callback_count++;
 diff --git a/src/codegen/builders/vector.cpp b/src/codegen/builders/vector.cpp
 index cbdd7f7..869afd2 100644
 --- a/src/codegen/builders/vector.cpp
@@ -114,6 +314,132 @@ index b52bf39..6500cb5 100644
    return static_cast<FileMappingHandle>(ret);
  #endif
  }
+diff --git a/src/core/timer_queue.cpp b/src/core/timer_queue.cpp
+index 5cfea05..9078e13 100644
+--- a/src/core/timer_queue.cpp
++++ b/src/core/timer_queue.cpp
+@@ -10,6 +10,9 @@
+  */
+ 
+ #include <algorithm>
++#include <atomic>
++#include <condition_variable>
++#include <mutex>
+ #include <forward_list>
+ 
+ #include <disruptorplus/multi_threaded_claim_strategy.hpp>
+@@ -18,6 +21,7 @@
+ #include <disruptorplus/spin_wait_strategy.hpp>
+ 
+ #include <rex/assert.h>
++#include <rex/logging.h>
+ #include <rex/thread.h>
+ #include <rex/thread/timer_queue.h>
+ 
+@@ -55,8 +59,25 @@ class TimerQueue {
+     // std::jthread auto-joins on destruction
+   }
+ 
++  // how late timers fire, logged every 10 s: the game paces sound and frames off them
++  void NoteLateness(clock::duration late) {
++    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(late).count();
++    ++fired_;
++    late_over_1ms_ += us > 1000;
++    worst_us_ = std::max<int64_t>(worst_us_, us);
++    total_us_ += std::max<int64_t>(us, 0);
++    if (const auto now = clock::now(); now - window_start_ >= std::chrono::seconds(10)) {
++      REXLOG_INFO("[timers] {} fired, {:.0f} us late on average, {} over 1 ms, worst {} us", fired_,
++                  double(total_us_) / double(fired_), late_over_1ms_, worst_us_);
++      fired_ = late_over_1ms_ = 0;
++      worst_us_ = total_us_ = 0;
++      window_start_ = now;
++    }
++  }
++
+   void TimerThreadMain(std::stop_token stop_token) {
+     dp::sequence_t next_sequence = 0;
++    uint64_t taken = 0;  // timers moved off the ring so far
+     const auto comp = [](const std::shared_ptr<WaitItem>& left,
+                          const std::shared_ptr<WaitItem>& right) {
+       return left->due_ < right->due_;
+@@ -65,17 +86,24 @@ class TimerQueue {
+     set_current_thread_name("rex::thread::TimerQueue");
+ 
+     while (!stop_token.stop_requested()) {
++      // read before looking, so a timer queued from here on wakes the sleep at the bottom
++      const uint64_t queued_before = queued_.load();
+       {
+-        // Consume new wait items and add them to sorted wait queue
+-        dp::sequence_t available = claim_strategy_.wait_until_published(
+-            next_sequence, next_sequence - 1,
+-            wait_queue_.empty() ? clock::time_point::max() : wait_queue_.front()->due_);
++        // Consume new wait items and add them to sorted wait queue. only what's already published: the sleep
++        // below does the waiting (this used to spin a core until the next timer was due), and with nothing
++        // new queued the check is skipped, since even an empty one spins briefly
++        dp::sequence_t available = next_sequence - 1;
++        if (queued_before != taken) {
++          available = claim_strategy_.wait_until_published(next_sequence, next_sequence - 1,
++                                                           clock::time_point::min());
++        }
+ 
+         // Check for timeout
+         if (available != next_sequence - 1) {
+           std::forward_list<std::shared_ptr<WaitItem>> wait_items;
+           do {
+             wait_items.push_front(std::move(buffer_[next_sequence]));
++            ++taken;
+           } while (next_sequence++ != available);
+ 
+           consumed_.publish(available);
+@@ -98,6 +126,7 @@ class TimerQueue {
+                                                         std::memory_order_acq_rel)) {
+             // Possibility to dispatch to a thread pool here
+             assert_not_null(wait_item->callback_);
++            NoteLateness(clock::now() - wait_item->due_);
+             wait_item->callback_(wait_item->userdata_);
+ 
+             if (wait_item->interval_ != clock::duration::zero() &&
+@@ -120,6 +149,15 @@ class TimerQueue {
+         wait_items.sort(comp);
+         wait_queue_.merge(wait_items, comp);
+       }
++
++      // sleep until the next timer is due or another is queued
++      std::unique_lock lock(wake_mutex_);
++      const auto woken = [&] { return queued_.load() != queued_before || stop_token.stop_requested(); };
++      if (wait_queue_.empty()) {
++        wake_cv_.wait(lock, woken);
++      } else {
++        wake_cv_.wait_until(lock, wait_queue_.front()->due_, woken);
++      }
+     }
+   }
+ 
+@@ -132,6 +170,11 @@ class TimerQueue {
+     auto sequence = claim_strategy_.claim_one();
+     buffer_[sequence] = std::move(wait_item);
+     claim_strategy_.publish(sequence);
++    {
++      std::lock_guard lock(wake_mutex_);
++      queued_.fetch_add(1);
++    }
++    wake_cv_.notify_one();
+ 
+     return wait_item_weak;
+   }
+@@ -149,6 +192,12 @@ class TimerQueue {
+   // This is a _sorted_ (ascending due_) list of active timers managed by a
+   // dedicated thread
+   std::forward_list<std::shared_ptr<WaitItem>> wait_queue_;
++  uint64_t fired_ = 0, late_over_1ms_ = 0;  // dispatch thread only
++  int64_t worst_us_ = 0, total_us_ = 0;
++  clock::time_point window_start_ = clock::now();
++  std::atomic<uint64_t> queued_{0};
++  std::mutex wake_mutex_;
++  std::condition_variable wake_cv_;
+   std::jthread dispatch_thread_;
+ };
+ 
 diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
 index 0d8f8af..da5cfec 100644
 --- a/src/graphics/CMakeLists.txt
@@ -926,6 +1252,109 @@ index 813bb1c..4f15a02 100644
    SCOPE_profile_cpu_f("hid");
    if (!assignment_) {
      return X_ERROR_DEVICE_NOT_CONNECTED;
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_audio_xma.cpp b/src/kernel/xboxkrnl/xboxkrnl_audio_xma.cpp
+index a84b5f5..e319c8e 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_audio_xma.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_audio_xma.cpp
+@@ -12,6 +12,7 @@
+ // Disable warnings about unused parameters for kernel functions
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+ 
++#include <cstdlib>
+ #include <cstring>
+ 
+ #include <rex/assert.h>
+@@ -122,6 +123,18 @@ struct XMA_CONTEXT_INIT {
+ };
+ static_assert_size(XMA_CONTEXT_INIT, 56);
+ 
++
++// BARDOWN_XMA_TRACE: the game's own reads and writes of a context
++static void TraceGame(const char* what, mapped_void context_ptr, int64_t value) {
++  static const bool tracing = [] {
++    const char* path = std::getenv("BARDOWN_XMA_TRACE");
++    return path && *path;
++  }();
++  if (!tracing) return;
++  auto* decoder = static_cast<audio::AudioSystem*>(REX_KERNEL_STATE()->emulator()->audio_system())->xma_decoder();
++  audio::TraceXma(what, uint32_t(decoder->GetContextId(context_ptr.guest_address())), nullptr, value);
++}
++
+ u32 XMAInitializeContext_entry(mapped_void context_ptr, ppc_ptr_t<XMA_CONTEXT_INIT> context_init) {
+   // Input buffers may be null (buffer 1 in 415607D4).
+   // Convert to host endianness.
+@@ -186,6 +199,7 @@ u32 XMAInitializeContext_entry(mapped_void context_ptr, ppc_ptr_t<XMA_CONTEXT_IN
+ 
+   context.Store(context_ptr);
+ 
++  TraceGame("g-init", context_ptr, context_init->input_buffer_read_offset);
+   StoreXmaContextIndexedRegister(REX_KERNEL_STATE(), 0x1A80, context_ptr.guest_address());
+ 
+   return 0;
+@@ -241,11 +255,13 @@ u32 XMASetInputBuffer0_entry(mapped_void context_ptr, mapped_void buffer, u32 pa
+ 
+ u32 XMAIsInputBuffer0Valid_entry(mapped_void context_ptr) {
+   XMA_CONTEXT_DATA context(context_ptr);
++  TraceGame("g-isin0", context_ptr, context.input_buffer_0_valid);
+   return context.input_buffer_0_valid;
+ }
+ 
+ u32 XMASetInputBuffer0Valid_entry(mapped_void context_ptr) {
+   XMA_CONTEXT_DATA context(context_ptr);
++  TraceGame("g-setin0", context_ptr, 0);
+   context.input_buffer_0_valid = 1;
+   context.Store(context_ptr);
+ 
+@@ -275,11 +291,13 @@ u32 XMASetInputBuffer1_entry(mapped_void context_ptr, mapped_void buffer, u32 pa
+ 
+ u32 XMAIsInputBuffer1Valid_entry(mapped_void context_ptr) {
+   XMA_CONTEXT_DATA context(context_ptr);
++  TraceGame("g-isin1", context_ptr, context.input_buffer_1_valid);
+   return context.input_buffer_1_valid;
+ }
+ 
+ u32 XMASetInputBuffer1Valid_entry(mapped_void context_ptr) {
+   XMA_CONTEXT_DATA context(context_ptr);
++  TraceGame("g-setin1", context_ptr, 0);
+   context.input_buffer_1_valid = 1;
+   context.Store(context_ptr);
+ 
+@@ -288,11 +306,13 @@ u32 XMASetInputBuffer1Valid_entry(mapped_void context_ptr) {
+ 
+ u32 XMAIsOutputBufferValid_entry(mapped_void context_ptr) {
+   XMA_CONTEXT_DATA context(context_ptr);
++  TraceGame("g-isvalid", context_ptr, context.output_buffer_valid);
+   return context.output_buffer_valid;
+ }
+ 
+ u32 XMASetOutputBufferValid_entry(mapped_void context_ptr) {
+   XMA_CONTEXT_DATA context(context_ptr);
++  TraceGame("g-setvalid", context_ptr, 0);
+   context.output_buffer_valid = 1;
+   context.Store(context_ptr);
+ 
+@@ -301,11 +321,13 @@ u32 XMASetOutputBufferValid_entry(mapped_void context_ptr) {
+ 
+ u32 XMAGetOutputBufferReadOffset_entry(mapped_void context_ptr) {
+   XMA_CONTEXT_DATA context(context_ptr);
++  TraceGame("g-getread", context_ptr, context.output_buffer_read_offset);
+   return context.output_buffer_read_offset;
+ }
+ 
+ u32 XMASetOutputBufferReadOffset_entry(mapped_void context_ptr, u32 value) {
+   XMA_CONTEXT_DATA context(context_ptr);
++  TraceGame("g-setread", context_ptr, value);
+   context.output_buffer_read_offset = value;
+   context.Store(context_ptr);
+ 
+@@ -314,6 +336,7 @@ u32 XMASetOutputBufferReadOffset_entry(mapped_void context_ptr, u32 value) {
+ 
+ u32 XMAGetOutputBufferWriteOffset_entry(mapped_void context_ptr) {
+   XMA_CONTEXT_DATA context(context_ptr);
++  TraceGame("g-getwrite", context_ptr, context.output_buffer_write_offset);
+   return context.output_buffer_write_offset;
+ }
+ 
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_video.cpp b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
 index 1254710..bb71144 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_video.cpp
@@ -1122,181 +1551,6 @@ index 4ede107..91062fc 100644
        if (entry.type == rex::cvar::FlagType::Boolean) {
          bool v = rex::string::from_string<bool>(current_val, false);
          if (ImGui::Checkbox("##v", &v)) {
-diff --git a/src/ui/renderdoc_api.cpp b/src/ui/renderdoc_api.cpp
-index e1a5287..b22006a 100644
---- a/src/ui/renderdoc_api.cpp
-+++ b/src/ui/renderdoc_api.cpp
-@@ -12,6 +12,10 @@
- #include <rex/logging.h>
- #include <rex/ui/renderdoc_api.h>
- 
-+#if REX_PLATFORM_LINUX
-+#include <dlfcn.h>
-+#endif
-+
- namespace rex {
- namespace ui {
- 
-@@ -28,6 +32,15 @@ std::unique_ptr<RenderDocAPI> RenderDocAPI::CreateIfConnected() {
-   // Try to load the RenderDoc library. If RenderDoc is attached, the library
-   // should already be loaded into the process and this will increment the
-   // reference count. If not attached, the load will fail and we return nullptr.
-+#if REX_PLATFORM_LINUX
-+  // a plain dlopen succeeds whenever renderdoc is merely installed and injects it into
-+  // every run (it then refuses wayland). only attach when it's already in the process
-+  if (void* attached = dlopen(platform::lib_names::kRenderDoc, RTLD_NOW | RTLD_NOLOAD)) {
-+    dlclose(attached);
-+  } else {
-+    return nullptr;
-+  }
-+#endif
-   if (!renderdoc_api->library_.Load(platform::lib_names::kRenderDoc)) {
-     return nullptr;
-   }
-diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
-index 8197bb4..5b12a36 100644
---- a/src/ui/vulkan/vulkan_device.cpp
-+++ b/src/ui/vulkan/vulkan_device.cpp
-@@ -650,6 +650,19 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
-       XE_UI_VULKAN_FEATURE_2(features_1_2, samplerMirrorClampToEdge);
-       XE_UI_VULKAN_FEATURE_2(features_1_2, uniformBufferStandardLayout);
-       XE_UI_VULKAN_FEATURE_2(features_1_2, scalarBlockLayout);
-+      // for bardown's native renderer: its shaders read constants through buffer addresses and pick textures
-+      // out of bindless arrays. the emulation never uses these
-+      for (VkBool32 VkPhysicalDeviceVulkan12Features::*f :
-+           {&VkPhysicalDeviceVulkan12Features::bufferDeviceAddress,
-+            &VkPhysicalDeviceVulkan12Features::descriptorIndexing,
-+            &VkPhysicalDeviceVulkan12Features::runtimeDescriptorArray,
-+            &VkPhysicalDeviceVulkan12Features::descriptorBindingPartiallyBound,
-+            &VkPhysicalDeviceVulkan12Features::descriptorBindingVariableDescriptorCount,
-+            &VkPhysicalDeviceVulkan12Features::descriptorBindingSampledImageUpdateAfterBind,
-+            &VkPhysicalDeviceVulkan12Features::shaderSampledImageArrayNonUniformIndexing}) {
-+        features_1_2.enabled.*f = features_1_2.supported.*f;
-+      }
-+      enabled_features.shaderInt64 = supported_features.shaderInt64;
-     }
-   } else {
-     if (ext_1_2_KHR_sampler_mirror_clamp_to_edge) {
-diff --git a/include/rex/ui/external_output.h b/include/rex/ui/external_output.h
-new file mode 100644
-index 0000000..a525cee
---- /dev/null
-+++ b/include/rex/ui/external_output.h
-@@ -0,0 +1,28 @@
-+#pragma once
-+
-+#include <chrono>
-+#include <cstdint>
-+#include <functional>
-+
-+#include <rex/ui/presenter.h>
-+
-+namespace rex::ui {
-+
-+// lets a renderer outside the gpu emulation own the picture: while set, the emulation's swaps no longer
-+// refresh the guest output, and the outside renderer refreshes it through RefreshGuestOutputExternal
-+void SetGuestOutputExternal(bool external);
-+
-+// how many frames the guest output has been given so far
-+uint64_t GuestOutputRefreshCount();
-+bool RefreshGuestOutputExternal(Presenter& presenter, uint32_t frontbuffer_width,
-+                                uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
-+                                uint32_t display_aspect_ratio_y,
-+                                std::function<bool(Presenter::GuestOutputRefreshContext& context)> refresher);
-+
-+// the outside renderer has taken a frame's data (called at each of its swaps). a gpu front end that draws
-+// nothing holds each swap until then, so fences after it don't tell the game the frame is done before it was
-+// read, as the 360's GPU, a frame behind, never did. returns false if the wait ran out
-+void ExternalFrameDone();
-+bool WaitExternalFrame(std::chrono::milliseconds limit);
-+
-+}  // namespace rex::ui
-diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
-index 23645ef..a12ee06 100644
---- a/src/ui/vulkan/vulkan_presenter.cpp
-+++ b/src/ui/vulkan/vulkan_presenter.cpp
-@@ -11,11 +11,15 @@
- 
- #include <algorithm>
- #include <atomic>
-+#include <chrono>
-+#include <thread>
- #include <cstddef>
- #include <cstdint>
- #include <cmath>
-+#include <cstdlib>
- #include <cstring>
- #include <memory>
-+#include <string>
- #include <utility>
- #include <vector>
- 
-@@ -24,6 +28,7 @@
- #include <rex/logging.h>
- #include <rex/math.h>
- #include <rex/platform.h>
-+#include <rex/ui/external_output.h>
- #include <rex/ui/vulkan/presenter.h>
- #include <rex/ui/vulkan/util.h>
- 
-@@ -58,6 +63,10 @@ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_mailbox, true, "UI/Vulkan",
- REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_fifo_relaxed, true, "UI/Vulkan",
-                     "Allow FIFO relaxed present mode");
- 
-+REXCVAR_DEFINE_STRING(present_frame_limit, "off", "Display",
-+                      "Most frames a second sent to the window; off is no limit beyond vsync")
-+    .allowed({"off", "30", "60", "120", "144", "240"});
-+
- namespace rex {
- namespace ui {
- namespace vulkan {
-@@ -2236,12 +2245,46 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
-   present_info.pSwapchains = &paint_context_.swapchain;
-   present_info.pImageIndices = &swapchain_image_index;
-   present_info.pResults = nullptr;
-+  // the frame limit: wait out the rest of this frame's slot. a slot missed by more than one frame starts over
-+  // rather than letting the next ones go out back to back
-+  // the setting is text written from the ui thread; this thread keeps its own number, updated on change
-+  static std::atomic<int> frame_limit = [] {
-+    rex::cvar::RegisterChangeCallback("present_frame_limit", [](std::string_view, std::string_view value) {
-+      frame_limit.store(std::atoi(std::string(value).c_str()), std::memory_order_relaxed);
-+    });
-+    return std::atoi(REXCVAR_GET(present_frame_limit).c_str());
-+  }();
-+  if (const int limit = frame_limit.load(std::memory_order_relaxed); limit > 0) {
-+    static auto next = std::chrono::steady_clock::now();
-+    const auto slot = std::chrono::nanoseconds(1'000'000'000 / limit);
-+    const auto now = std::chrono::steady_clock::now();
-+    if (next > now) std::this_thread::sleep_until(next);
-+    next = std::max(next, now - slot) + slot;
-+  }
-   VkResult present_result;
-   {
-     const VulkanDevice::Queue::Acquisition queue_acquisition =
-         vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
-     present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
-   }
-+  // how often frames reach the window, every 10 s, and how evenly the game's own frames got there: shown
-+  // again on the next present, or replaced before any present showed them (each is a visible hitch)
-+  {
-+    static uint64_t presents = 0, repeats = 0, dropped = 0, last_frame = 0;
-+    static auto window_start = std::chrono::steady_clock::now();
-+    ++presents;
-+    const uint64_t frame = GuestOutputRefreshCount();
-+    if (frame == last_frame) ++repeats;
-+    else if (last_frame && frame > last_frame + 1) dropped += frame - last_frame - 1;
-+    last_frame = frame;
-+    const auto now = std::chrono::steady_clock::now();
-+    if (now - window_start >= std::chrono::seconds(10)) {
-+      REXLOG_INFO("[present] {:.0f} a second; game frames shown twice {}, never shown {}",
-+                  presents / std::chrono::duration<double>(now - window_start).count(), repeats, dropped);
-+      presents = repeats = dropped = 0;
-+      window_start = now;
-+    }
-+  }
-   switch (present_result) {
-     case VK_SUCCESS:
-       return PaintResult::kPresented;
 diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
 index 7360ed9..964ebef 100644
 --- a/src/ui/presenter.cpp
@@ -1427,154 +1681,144 @@ index 7360ed9..964ebef 100644
  #if REX_PLATFORM_WIN32
    if (!AreUITicksNeededFromUIThread()) {
      return;
-diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
-index 20a2cd8..70d995e 100644
---- a/src/audio/sdl/sdl_audio_driver.cpp
-+++ b/src/audio/sdl/sdl_audio_driver.cpp
-@@ -178,10 +178,20 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
-   const StereoFold fold = GetStereoFold();
-   const SurroundMix mix = GetSurroundMix();
-   const float gain = GetOutputGain();
-+  // how often the speakers asked for sound and none was ready (heard as static), every 10 s once playing
-+  static uint64_t asked = 0, dry = 0;
-+  static auto window_start = std::chrono::steady_clock::now();
-+  if (const auto now = std::chrono::steady_clock::now(); now - window_start >= std::chrono::seconds(10)) {
-+    if (asked) REXAPU_INFO("[audio] {} frames asked for, {} ran dry", asked, dry);
-+    asked = dry = 0;
-+    window_start = now;
+diff --git a/src/ui/renderdoc_api.cpp b/src/ui/renderdoc_api.cpp
+index e1a5287..b22006a 100644
+--- a/src/ui/renderdoc_api.cpp
++++ b/src/ui/renderdoc_api.cpp
+@@ -12,6 +12,10 @@
+ #include <rex/logging.h>
+ #include <rex/ui/renderdoc_api.h>
+ 
++#if REX_PLATFORM_LINUX
++#include <dlfcn.h>
++#endif
++
+ namespace rex {
+ namespace ui {
+ 
+@@ -28,6 +32,15 @@ std::unique_ptr<RenderDocAPI> RenderDocAPI::CreateIfConnected() {
+   // Try to load the RenderDoc library. If RenderDoc is attached, the library
+   // should already be loaded into the process and this will increment the
+   // reference count. If not attached, the load will fail and we return nullptr.
++#if REX_PLATFORM_LINUX
++  // a plain dlopen succeeds whenever renderdoc is merely installed and injects it into
++  // every run (it then refuses wayland). only attach when it's already in the process
++  if (void* attached = dlopen(platform::lib_names::kRenderDoc, RTLD_NOW | RTLD_NOLOAD)) {
++    dlclose(attached);
++  } else {
++    return nullptr;
 +  }
-   while (additional_amount > 0) {
-     static uint32_t sdl_callback_count = 0;
-     std::unique_lock<std::mutex> guard(driver->frames_mutex_);
-+    ++asked;
-     if (driver->frames_queued_.empty()) {
-+      ++dry;
-       if (sdl_callback_count < 10) {
-         REXAPU_DEBUG("SDLCallback: no frames queued (silence)");
-         sdl_callback_count++;
-diff --git a/src/core/timer_queue.cpp b/src/core/timer_queue.cpp
-index 5cfea05..9078e13 100644
---- a/src/core/timer_queue.cpp
-+++ b/src/core/timer_queue.cpp
-@@ -10,6 +10,9 @@
-  */
++#endif
+   if (!renderdoc_api->library_.Load(platform::lib_names::kRenderDoc)) {
+     return nullptr;
+   }
+diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
+index 8197bb4..5b12a36 100644
+--- a/src/ui/vulkan/vulkan_device.cpp
++++ b/src/ui/vulkan/vulkan_device.cpp
+@@ -650,6 +650,19 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+       XE_UI_VULKAN_FEATURE_2(features_1_2, samplerMirrorClampToEdge);
+       XE_UI_VULKAN_FEATURE_2(features_1_2, uniformBufferStandardLayout);
+       XE_UI_VULKAN_FEATURE_2(features_1_2, scalarBlockLayout);
++      // for bardown's native renderer: its shaders read constants through buffer addresses and pick textures
++      // out of bindless arrays. the emulation never uses these
++      for (VkBool32 VkPhysicalDeviceVulkan12Features::*f :
++           {&VkPhysicalDeviceVulkan12Features::bufferDeviceAddress,
++            &VkPhysicalDeviceVulkan12Features::descriptorIndexing,
++            &VkPhysicalDeviceVulkan12Features::runtimeDescriptorArray,
++            &VkPhysicalDeviceVulkan12Features::descriptorBindingPartiallyBound,
++            &VkPhysicalDeviceVulkan12Features::descriptorBindingVariableDescriptorCount,
++            &VkPhysicalDeviceVulkan12Features::descriptorBindingSampledImageUpdateAfterBind,
++            &VkPhysicalDeviceVulkan12Features::shaderSampledImageArrayNonUniformIndexing}) {
++        features_1_2.enabled.*f = features_1_2.supported.*f;
++      }
++      enabled_features.shaderInt64 = supported_features.shaderInt64;
+     }
+   } else {
+     if (ext_1_2_KHR_sampler_mirror_clamp_to_edge) {
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index 23645ef..a12ee06 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -11,11 +11,15 @@
  
  #include <algorithm>
-+#include <atomic>
-+#include <condition_variable>
-+#include <mutex>
- #include <forward_list>
+ #include <atomic>
++#include <chrono>
++#include <thread>
+ #include <cstddef>
+ #include <cstdint>
+ #include <cmath>
++#include <cstdlib>
+ #include <cstring>
+ #include <memory>
++#include <string>
+ #include <utility>
+ #include <vector>
  
- #include <disruptorplus/multi_threaded_claim_strategy.hpp>
-@@ -18,6 +21,7 @@
- #include <disruptorplus/spin_wait_strategy.hpp>
+@@ -24,6 +28,7 @@
+ #include <rex/logging.h>
+ #include <rex/math.h>
+ #include <rex/platform.h>
++#include <rex/ui/external_output.h>
+ #include <rex/ui/vulkan/presenter.h>
+ #include <rex/ui/vulkan/util.h>
  
- #include <rex/assert.h>
-+#include <rex/logging.h>
- #include <rex/thread.h>
- #include <rex/thread/timer_queue.h>
+@@ -58,6 +63,10 @@ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_mailbox, true, "UI/Vulkan",
+ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_fifo_relaxed, true, "UI/Vulkan",
+                     "Allow FIFO relaxed present mode");
  
-@@ -55,8 +59,25 @@ class TimerQueue {
-     // std::jthread auto-joins on destruction
++REXCVAR_DEFINE_STRING(present_frame_limit, "off", "Display",
++                      "Most frames a second sent to the window; off is no limit beyond vsync")
++    .allowed({"off", "30", "60", "120", "144", "240"});
++
+ namespace rex {
+ namespace ui {
+ namespace vulkan {
+@@ -2236,12 +2245,46 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+   present_info.pSwapchains = &paint_context_.swapchain;
+   present_info.pImageIndices = &swapchain_image_index;
+   present_info.pResults = nullptr;
++  // the frame limit: wait out the rest of this frame's slot. a slot missed by more than one frame starts over
++  // rather than letting the next ones go out back to back
++  // the setting is text written from the ui thread; this thread keeps its own number, updated on change
++  static std::atomic<int> frame_limit = [] {
++    rex::cvar::RegisterChangeCallback("present_frame_limit", [](std::string_view, std::string_view value) {
++      frame_limit.store(std::atoi(std::string(value).c_str()), std::memory_order_relaxed);
++    });
++    return std::atoi(REXCVAR_GET(present_frame_limit).c_str());
++  }();
++  if (const int limit = frame_limit.load(std::memory_order_relaxed); limit > 0) {
++    static auto next = std::chrono::steady_clock::now();
++    const auto slot = std::chrono::nanoseconds(1'000'000'000 / limit);
++    const auto now = std::chrono::steady_clock::now();
++    if (next > now) std::this_thread::sleep_until(next);
++    next = std::max(next, now - slot) + slot;
++  }
+   VkResult present_result;
+   {
+     const VulkanDevice::Queue::Acquisition queue_acquisition =
+         vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
+     present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
    }
- 
-+  // how late timers fire, logged every 10 s: the game paces sound and frames off them
-+  void NoteLateness(clock::duration late) {
-+    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(late).count();
-+    ++fired_;
-+    late_over_1ms_ += us > 1000;
-+    worst_us_ = std::max<int64_t>(worst_us_, us);
-+    total_us_ += std::max<int64_t>(us, 0);
-+    if (const auto now = clock::now(); now - window_start_ >= std::chrono::seconds(10)) {
-+      REXLOG_INFO("[timers] {} fired, {:.0f} us late on average, {} over 1 ms, worst {} us", fired_,
-+                  double(total_us_) / double(fired_), late_over_1ms_, worst_us_);
-+      fired_ = late_over_1ms_ = 0;
-+      worst_us_ = total_us_ = 0;
-+      window_start_ = now;
++  // how often frames reach the window, every 10 s, and how evenly the game's own frames got there: shown
++  // again on the next present, or replaced before any present showed them (each is a visible hitch)
++  {
++    static uint64_t presents = 0, repeats = 0, dropped = 0, last_frame = 0;
++    static auto window_start = std::chrono::steady_clock::now();
++    ++presents;
++    const uint64_t frame = GuestOutputRefreshCount();
++    if (frame == last_frame) ++repeats;
++    else if (last_frame && frame > last_frame + 1) dropped += frame - last_frame - 1;
++    last_frame = frame;
++    const auto now = std::chrono::steady_clock::now();
++    if (now - window_start >= std::chrono::seconds(10)) {
++      REXLOG_INFO("[present] {:.0f} a second; game frames shown twice {}, never shown {}",
++                  presents / std::chrono::duration<double>(now - window_start).count(), repeats, dropped);
++      presents = repeats = dropped = 0;
++      window_start = now;
 +    }
 +  }
-+
-   void TimerThreadMain(std::stop_token stop_token) {
-     dp::sequence_t next_sequence = 0;
-+    uint64_t taken = 0;  // timers moved off the ring so far
-     const auto comp = [](const std::shared_ptr<WaitItem>& left,
-                          const std::shared_ptr<WaitItem>& right) {
-       return left->due_ < right->due_;
-@@ -65,17 +86,24 @@ class TimerQueue {
-     set_current_thread_name("rex::thread::TimerQueue");
- 
-     while (!stop_token.stop_requested()) {
-+      // read before looking, so a timer queued from here on wakes the sleep at the bottom
-+      const uint64_t queued_before = queued_.load();
-       {
--        // Consume new wait items and add them to sorted wait queue
--        dp::sequence_t available = claim_strategy_.wait_until_published(
--            next_sequence, next_sequence - 1,
--            wait_queue_.empty() ? clock::time_point::max() : wait_queue_.front()->due_);
-+        // Consume new wait items and add them to sorted wait queue. only what's already published: the sleep
-+        // below does the waiting (this used to spin a core until the next timer was due), and with nothing
-+        // new queued the check is skipped, since even an empty one spins briefly
-+        dp::sequence_t available = next_sequence - 1;
-+        if (queued_before != taken) {
-+          available = claim_strategy_.wait_until_published(next_sequence, next_sequence - 1,
-+                                                           clock::time_point::min());
-+        }
- 
-         // Check for timeout
-         if (available != next_sequence - 1) {
-           std::forward_list<std::shared_ptr<WaitItem>> wait_items;
-           do {
-             wait_items.push_front(std::move(buffer_[next_sequence]));
-+            ++taken;
-           } while (next_sequence++ != available);
- 
-           consumed_.publish(available);
-@@ -98,6 +126,7 @@ class TimerQueue {
-                                                         std::memory_order_acq_rel)) {
-             // Possibility to dispatch to a thread pool here
-             assert_not_null(wait_item->callback_);
-+            NoteLateness(clock::now() - wait_item->due_);
-             wait_item->callback_(wait_item->userdata_);
- 
-             if (wait_item->interval_ != clock::duration::zero() &&
-@@ -120,6 +149,15 @@ class TimerQueue {
-         wait_items.sort(comp);
-         wait_queue_.merge(wait_items, comp);
-       }
-+
-+      // sleep until the next timer is due or another is queued
-+      std::unique_lock lock(wake_mutex_);
-+      const auto woken = [&] { return queued_.load() != queued_before || stop_token.stop_requested(); };
-+      if (wait_queue_.empty()) {
-+        wake_cv_.wait(lock, woken);
-+      } else {
-+        wake_cv_.wait_until(lock, wait_queue_.front()->due_, woken);
-+      }
-     }
-   }
- 
-@@ -132,6 +170,11 @@ class TimerQueue {
-     auto sequence = claim_strategy_.claim_one();
-     buffer_[sequence] = std::move(wait_item);
-     claim_strategy_.publish(sequence);
-+    {
-+      std::lock_guard lock(wake_mutex_);
-+      queued_.fetch_add(1);
-+    }
-+    wake_cv_.notify_one();
- 
-     return wait_item_weak;
-   }
-@@ -149,6 +192,12 @@ class TimerQueue {
-   // This is a _sorted_ (ascending due_) list of active timers managed by a
-   // dedicated thread
-   std::forward_list<std::shared_ptr<WaitItem>> wait_queue_;
-+  uint64_t fired_ = 0, late_over_1ms_ = 0;  // dispatch thread only
-+  int64_t worst_us_ = 0, total_us_ = 0;
-+  clock::time_point window_start_ = clock::now();
-+  std::atomic<uint64_t> queued_{0};
-+  std::mutex wake_mutex_;
-+  std::condition_variable wake_cv_;
-   std::jthread dispatch_thread_;
- };
- 
+   switch (present_result) {
+     case VK_SUCCESS:
+       return PaintResult::kPresented;

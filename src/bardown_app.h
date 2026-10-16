@@ -11,7 +11,10 @@
 #include <string>
 #include <vector>
 #include <ctime>
+#include <thread>
+#include <chrono>
 
+#include <rex/audio/sdl/sdl_audio_driver.h>
 #include <rex/cvar.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem.h>
@@ -20,6 +23,7 @@
 #include <rex/logging.h>
 #include <rex/rex_app.h>
 #include <rex/runtime.h>
+#include <rex/ui/keybinds.h>
 #include <rex/system/xmemory.h>
 
 #include "first_run.h"
@@ -246,11 +250,41 @@ class BardownApp : public rex::ReXApp {
     rex::cvar::SetFlagByName("vulkan_allow_present_mode_mailbox", allow);
   }
 
+  static void SaveAudioSnapshot() {
+    std::filesystem::path dir = rex::cvar::GetFlagByName("log_file");
+    dir = dir.empty() ? std::filesystem::path("logs") : dir.parent_path();
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    char stamp[32];
+    const std::time_t now = std::time(nullptr);
+    std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", std::localtime(&now));
+    const auto path = dir / (std::string("audio-") + stamp + ".wav");
+    if (rex::audio::sdl::SaveRecentAudio(path))
+      REXLOG_INFO("[audio] snapshot: the last 10 seconds of sound saved to {}", path.string());
+    else
+      REXLOG_WARN("[audio] snapshot: nothing to save to {}", path.string());
+  }
+
   // F1 opens the settings, as recompilations usually have it (the runtime's own default is F4); a key the
   // player picked in the settings stays
   void OnCreateDialogs(rex::ui::ImGuiDrawer*) override {
     const auto* bind = rex::cvar::GetFlagInfo("bind_settings");
     if (bind && bind->source == rex::cvar::Source::kDefault) rex::cvar::SetFlagByName("bind_settings", "F1");
+    // under renderdoc: F11 captures the frame on screen (renderdoc's own keys don't reach a wayland window)
+#if defined(__linux__)
+    if (bardown::RenderDocApi())
+      rex::ui::RegisterBind("bind_renderdoc_capture", "F11", "Capture the frame with RenderDoc",
+                            &bardown::CaptureRenderDocNow);
+#endif
+    // heard a glitch: the last 10 seconds of sound go into the logs folder, to look at rather than describe
+    rex::ui::RegisterBind("bind_audio_snapshot", "F8", "Save the last 10 seconds of sound to the logs folder",
+                          &SaveAudioSnapshot);
+    // BARDOWN_AUDIO_SNAPSHOT_AT=<seconds>: the same, on a timer, for headless runs
+    if (const char* at = std::getenv("BARDOWN_AUDIO_SNAPSHOT_AT"); at && *at)
+      std::thread([seconds = std::atof(at)] {
+        std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
+        SaveAudioSnapshot();
+      }).detach();
   }
 
   // the engine probes cache:\<path> before falling back to the .big archives and writes

@@ -50,7 +50,6 @@ servers, which are long gone.
 
 Known issues:
 
-- a short buzz in the audio now and then; not tracked down yet
 - cutscenes run at 30 fps, as they do on the Xbox; gameplay and menus run at 60
 
 ![The opening faceoff](docs/images/faceoff.jpg)
@@ -160,7 +159,8 @@ been tried yet.
 with every tuning value the game has, over thirteen thousand of them, from AI and physics to animation.
 Changes to those take effect at once and stay saved. More in [docs/SETTINGS.md](docs/SETTINGS.md).
 
-F3 shows frame times, and the backtick key opens a console.
+F3 shows frame times, and the backtick key opens a console. F8 saves the last 10 seconds of sound to
+the `logs` folder, handy for reporting an audio problem.
 
 ## No game data here
 

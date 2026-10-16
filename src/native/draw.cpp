@@ -1057,6 +1057,9 @@ void Draw(uint8_t* base, uint32_t dev, Route route, const DrawCall& call) {
   }
   const float alpha_ref = alpha_to_mask ? 0.5f : RegF(base, dev, 0x210E);
   std::memcpy(&sc[132], &alpha_ref, 4);
+  // the comparison too (RB_COLORCONTROL bits 0-2: 3 keeps alpha at or below the reference, 4 above it, ...); alpha to
+  // mask keeps what's at least half opaque
+  sc[133] = alpha_to_mask ? 6u : colorctl & 7;
   std::memcpy(shared.host + 800, tex_scale, sizeof(tex_scale));
   std::memcpy(shared.host + 928, tex_lod, sizeof(tex_lod));
   // from 544: the vfetchIndexed table, 16 bytes a location
@@ -1307,7 +1310,7 @@ void Resolve(const uint8_t* base, uint32_t dev, uint32_t flags, uint32_t src_rec
   const uint32_t address = g::PhysicalAddress(words[1] & 0xFFFFF000u);
   const uint32_t tex_w = (words[2] & 0x1FFF) + 1, tex_h = (words[2] >> 13 & 0x1FFF) + 1;
   const uint32_t s = RenderScale();
-  Image* dst = ResolveTexture(address, tex_w * s, tex_h * s, src->format, words[3] >> 1 & 0xFFF);
+  Image* dst = ResolveTexture(address, tex_w * s, tex_h * s, src->format, words);
   if (stats.tracing())
     REXLOG_INFO("[trace] resolve flags {:X} from {} {}x{} rect {} {} {} {} to {:08X} {}x{} fmt {} point {} {}", flags,
                 static_cast<const void*>(src), src->width, src->height, src_rect ? int(g::U32(base, src_rect)) : -1,
