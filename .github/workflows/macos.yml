@@ -67,14 +67,32 @@ jobs:
           rm key generated.tar.zst.gpg
           ls generated/default | wc -l
 
+      # MoltenVK's build fetches CPM.cmake and its sources from GitHub at configure time, with no retry: one dropped
+      # download (v0.3.7's Intel job) and the build fails. kept between runs, fetched with retries when missing
+      - name: MoltenVK sources
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/CPM
+          key: cpm-${{ matrix.arch }}-${{ hashFiles('third_party/rexglue-sdk/thirdparty/moltenvk/cmake/**') }}
+
       - name: SDK
         run: |
-          cmake -S third_party/rexglue-sdk -B sdk-build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_OSX_ARCHITECTURES="$ARCH" -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 \
-            -DCMAKE_C_FLAGS="$CPU_FLAGS" -DCMAKE_CXX_FLAGS="$CPU_FLAGS" \
-            -DCMAKE_C_COMPILER=/usr/bin/clang -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_INSTALL_PREFIX="$PWD/sdk-install"
+          cpm=~/.cache/CPM/cpm/CPM_0.40.8.cmake
+          if [ ! -s "$cpm" ]; then
+            mkdir -p "$(dirname "$cpm")"
+            curl -fsSL --retry 5 --retry-all-errors -o "$cpm" \
+              https://github.com/cpm-cmake/CPM.cmake/releases/download/v0.40.8/CPM.cmake
+          fi
+          for i in 1 2 3; do
+            cmake -S third_party/rexglue-sdk -B sdk-build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_OSX_ARCHITECTURES="$ARCH" -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 \
+              -DCMAKE_C_FLAGS="$CPU_FLAGS" -DCMAKE_CXX_FLAGS="$CPU_FLAGS" \
+              -DCMAKE_C_COMPILER=/usr/bin/clang -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
+              -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_INSTALL_PREFIX="$PWD/sdk-install" && break
+            [ $i = 3 ] && exit 1
+            sleep 30
+          done
           cmake --build sdk-build --target install --parallel
 
       - name: Shader translator
