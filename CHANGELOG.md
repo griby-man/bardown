@@ -2,6 +2,15 @@
 
 What changed, newest first. Dates are when it landed.
 
+## 0.3.7 (2026-10-17)
+
+- **No more nets, gloves or jerseys on players' faces.** The game builds player textures (skins, gear) on the
+  GPU and has the CPU pack them. Some of those builds stayed on the GPU instead of going to memory, so the CPU
+  packed whatever was there before and a random player got a net or a glove for a face. Every player-sized build
+  now goes to memory, as on the Xbox. A texture the game writes while it's being read is caught and read again.
+- **macOS (experimental).** A universal app for Apple Silicon and Intel Macs, built on GitHub. Not played on a
+  real Mac yet, and not notarised: the first time, right-click bardown and choose Open.
+
 ## 0.3.6 (2026-10-16)
 
 - **Faces right after a jersey change.** The game builds team gear on the GPU and has the CPU pack it into
