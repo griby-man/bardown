@@ -121,12 +121,7 @@ Every key can be changed under F1, Keybinds.
 - **Anything else**: the `logs` folder beside bardown (or in `%LOCALAPPDATA%\bardown` on Windows) has one
   log per start; the newest one says what happened.
 
-### macOS (experimental)
-
-The GitHub release has a universal app for Apple Silicon and Intel Macs (macOS 13.3 or later), built by
-GitHub's Mac runners. It hasn't been played on a real Mac yet, so reports are welcome. It isn't notarised: the
-first time, right-click bardown and choose Open. Settings, saves, logs and the extracted game go in
-`~/Library/Application Support/bardown`.
+A macOS build isn't on the releases yet.
 
 ## System requirements
 
