@@ -1,0 +1,38 @@
+name: macos-package
+
+# packaging only: the app and .dmg from the two builds a macos run already made (kept 3 days), to try packaging
+# changes without building everything again
+on:
+  workflow_dispatch:
+    inputs:
+      run:
+        description: "the macos run whose builds to package"
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  package:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: The builds
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download "${{ inputs.run }}" -R "$GITHUB_REPOSITORY" -p 'mac-*' -D builds
+          mv builds/*/mac-*.tar .
+
+      - name: bardown.app and the .dmg
+        run: |
+          scripts/macos-package.sh "$(git rev-parse --short HEAD)"
+          echo "DMG=$(ls bardown-*-macos-universal.dmg)" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: bardown-macos-universal
+          path: ${{ env.DMG }}
+          retention-days: 14

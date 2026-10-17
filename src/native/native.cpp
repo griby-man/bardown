@@ -123,6 +123,8 @@ std::optional<Translator> FindTranslator() {
 #endif
   const Translator candidates[] = {
       {exe / (std::string("xenosrecomp") + kExt), exe / "shader_common.h"},
+      // a Mac app keeps the header with its data, in Contents/Resources
+      {exe / (std::string("xenosrecomp") + kExt), exe / "../Resources/shader_common.h"},
       {exe / (std::string("../xenosrecomp/XenosRecomp/XenosRecomp") + kExt),
        exe / "../../../third_party/XenosRecomp/XenosRecomp/shader_common.h"},
   };
