@@ -162,6 +162,7 @@ struct Cache {
   std::unordered_map<uint32_t, uint32_t> reloads;  // by base
   uint64_t late_changed = 0;
   uint64_t resolved_mismatch = 0;  // binds that found a resolved image declared as another texture
+  uint64_t raced = 0;              // loads that read memory again because the game wrote it during the copy
   uint64_t frame = 0;                // swaps assembled
   std::vector<std::pair<uint64_t, std::unique_ptr<Texture>>> resolved_dropped;  // by the frame they were dropped in
 };
@@ -297,7 +298,12 @@ uint32_t SamplerFor(const xenos::xe_gpu_texture_fetch_t& f) {
 
 // BARDOWN_NATIVE_VERIFY: textures held from guest memory that changed there without a write notice, i.e. drawn
 // stale. checked from the swap every 600 frames; the hash is taken at load only when this is on
-const bool verify = std::getenv("BARDOWN_NATIVE_VERIFY") != nullptr;
+// read on first use, not as the library loads: on Android the app's settings become environment variables only
+// after that
+bool Verify() {
+  static const bool on = std::getenv("BARDOWN_NATIVE_VERIFY") != nullptr;
+  return on;
+}
 
 uint64_t GuestHash(const Texture& t) {
   uint64_t hash = XXH3_64bits(Physical(t.base), t.size);
@@ -428,20 +434,56 @@ bool Fill(Texture& t, bool create) {
   return true;
 }
 
+// the guest memory Fill copies a texture from: its base level, and its mips when it has them
+bool GuestRanges(Texture& t) {
+  TextureInfo info;
+  if (!TextureInfo::Prepare(t.fetch, &info)) return false;
+  const bool cube = info.dimension == xenos::DataDimension::kCube;
+  namespace tu = rex::graphics::texture_util;
+  uint32_t base_page, mip_page, min_level, max_level;
+  tu::GetSubresourcesFromFetchConstant(t.fetch, nullptr, nullptr, nullptr, &base_page, &mip_page, &min_level,
+                                       &max_level);
+  if (!base_page) return false;
+  const uint32_t levels = std::min(max_level + 1, 13u);
+  const auto layout = tu::GetGuestTextureLayout(info.dimension, t.fetch.pitch, info.width + 1, info.height + 1,
+                                                cube ? 6 : 1, info.is_tiled, info.format, t.fetch.packed_mips, true,
+                                                levels - 1);
+  t.base = base_page << 12;
+  t.size = layout.base.level_data_extent_bytes;
+  t.mip_base = mip_page && levels > 1 ? mip_page << 12 : 0;
+  t.mip_size = mip_page && levels > 1 ? layout.mips_total_extent_bytes : 0;
+  return true;
+}
+
 std::unique_ptr<Texture> Load(const xenos::xe_gpu_texture_fetch_t& fetch, const Format& format, bool late) {
   auto t = std::make_unique<Texture>();
   t->fetch = fetch;
   t->format = format;
+  if (!GuestRanges(*t)) return nullptr;
+  // what memory held as the copy started: the watch below only starts after the copy, so a write in between (the
+  // game writing a player's face as the match loads, on another thread) would be missed for good and the old
+  // contents shown all game
+  uint64_t copied = GuestHash(*t);
   if (!Fill(*t, true)) return nullptr;
   // small linear textures are data the game rewrites in place (the crowd's animation palettes), and a write the
   // watch misses would leave a stale copy for good: those are checked against memory every frame they're used
   t->late = late || (!fetch.tiled && t->size + t->mip_size <= 256 * 1024);
-  if (t->late || verify) t->hash = GuestHash(*t);
   if (!t->late && c.memory) {
     // tell us when the CPU writes it again
     c.memory->EnablePhysicalMemoryAccessCallbacks(t->base, t->size, true, false);
     if (t->mip_size) c.memory->EnablePhysicalMemoryAccessCallbacks(t->mip_base, t->mip_size, true, false);
+    // any write from here on is watched; one that landed during the copy shows as changed memory, so read it again
+    for (int tries = 0; tries < 3; ++tries) {
+      const uint64_t now = GuestHash(*t);
+      if (now == copied) break;
+      copied = now;
+      if (++c.raced <= 50)
+        REXLOG_INFO("[native] texture {:08X} ({}x{} format {}) was written while it was read; read again", t->base,
+                    fetch.size_2d.width + 1, fetch.size_2d.height + 1, uint32_t(fetch.format));
+      Fill(*t, false);
+    }
   }
+  if (t->late || Verify()) t->hash = copied;
   return t;
 }
 
@@ -521,7 +563,7 @@ TextureBinding BindTexture(const uint32_t words[6], bool vertex) {
     // through its own swizzle; the image holds the target as it was, so read through the difference. the
     // same swizzle (the usual case) is the image as it is
     Texture& t = *it->second;
-    if (verify && c.frame > t.resolved_frame + 120) {
+    if (Verify() && c.frame > t.resolved_frame + 120) {
       static std::unordered_map<uint32_t, uint64_t> told;
       if (told[base]++ == 0)
         REXLOG_INFO("[native] old resolved image bound: {:08X} {}x{} format {}, resolved {} frames ago", base,
@@ -665,7 +707,7 @@ void DumpDXT1(const uint32_t words[6], const char* dir) {
 }
 
 uint64_t CheckStale() {
-  if (!verify) return 0;
+  if (!Verify()) return 0;
   std::lock_guard lock(c.mutex);
   DropWritten();
   uint64_t stale = 0;

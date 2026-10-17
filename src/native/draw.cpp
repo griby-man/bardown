@@ -688,6 +688,28 @@ bool ReadBefore(uint32_t dest) {
   return read_back.addresses.count(dest) != 0;
 }
 
+// the game builds player textures (skins, gear) in power-of-two targets at load and has the CPU pack them, not
+// always with the team-colour shaders that mark a composition; screen, bloom and shadow targets are screen-sized and
+// stay on the GPU. so every power-of-two colour resolve goes to memory, as on the 360, unless the same address is
+// resolved frame after frame (an effect, not a build), which would cost a GPU wait every frame
+struct {
+  std::mutex mutex;
+  std::unordered_map<uint32_t, std::pair<uint64_t, uint32_t>> streaks;  // by address: last frame, frames in a row
+} every_frame;
+bool BuiltForCpu(uint32_t dest, const uint32_t words[6], uint64_t frame) {
+  const uint32_t format = words[1] & 0x3F, w = (words[2] & 0x1FFF) + 1, h = (words[2] >> 13 & 0x1FFF) + 1;
+  if (format != 6 || (w & (w - 1)) || (h & (h - 1))) return false;
+  std::lock_guard lock(every_frame.mutex);
+  auto& [last, streak] = every_frame.streaks[dest];
+  if (last != frame) streak = last + 1 == frame ? streak + 1 : 1;
+  last = frame;
+  // the one way a player-sized resolve stays on the GPU now. the faces bug was this happening by mistake, so it's
+  // always logged: in a normal log this line should only name per-frame effects, never anything at match load
+  if (streak == 30)
+    REXLOG_INFO("[native] {}x{} resolve to {:08X} every frame for 30 frames: kept on the GPU from now on", w, h, dest);
+  return streak < 30;
+}
+
 void ResolvedOut(uint32_t dev) {
   std::lock_guard lock(composing.mutex);
   composing.target.erase(dev);
@@ -1530,7 +1552,9 @@ extern "C" REX_FUNC(sub_827E6760) {
       compose = true;
       if (dest) RememberReadBack(dest);
     } else if (NativeOnly() && dest) {
-      compose = ReadBefore(dest);
+      uint32_t words[6];
+      for (int w = 0; w < 6; ++w) words[w] = g::U32(base, texture + 28 + 4 * w);
+      compose = ReadBefore(dest) || BuiltForCpu(dest, words, stats.frame);
     }
     if (!NativeOnly() || (compose && !NullGpu())) __imp__sub_827E6760(ctx, base);
     if (compose) ResolvedOut(dev);
