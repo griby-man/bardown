@@ -55,9 +55,10 @@ cat > "$app/Contents/Info.plist" <<PLIST
 </dict></plist>
 PLIST
 
-# an ad-hoc signature: not notarised, but Apple Silicon won't run an unsigned arm64 binary at all. each library and
-# program first, then the app (--deep doesn't reach code kept in Resources)
-find "$app/Contents" -type f | while read -r f; do
+# an ad-hoc signature: not notarised, but Apple Silicon won't run an unsigned arm64 binary at all. every library and
+# helper program first, then the app, which signs the main program and checks all of the rest (--deep doesn't
+# reach code kept in Resources, and signing the main program on its own already wants everything beside it signed)
+find "$app/Contents" -type f ! -path "$bin/bardown" | while read -r f; do
   if file "$f" | grep -q Mach-O; then codesign --force --sign - "$f"; fi
 done
 codesign --force --sign - "$app"
