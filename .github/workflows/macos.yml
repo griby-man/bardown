@@ -36,8 +36,12 @@ jobs:
         with:
           submodules: recursive
 
+      # ccache brings Homebrew's fmt along. on Intel Macs its headers land in /usr/local/include, which the compiler
+      # always searches, so the game compiled against that fmt while linking the SDK's: unlinked, ccache keeps its copy
       - name: Tools
-        run: brew install ninja vulkan-loader molten-vk ccache zstd
+        run: |
+          brew install ninja vulkan-loader molten-vk ccache zstd
+          brew unlink fmt || true
 
       - name: Patches
         run: |
