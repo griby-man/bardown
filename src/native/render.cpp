@@ -20,8 +20,6 @@
 #include <rex/system/xmemory.h>
 #include <rex/ui/external_output.h>
 #include <rex/ui/renderdoc_api.h>
-// the full RenderDoc header: on macOS the runtime's only declares the struct
-#include <renderdoc_app.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/provider.h>
 
@@ -100,10 +98,13 @@ struct Renderer {
 };
 Renderer r;
 
+// RenderDoc doesn't run on macOS, and its header doesn't build there: no frame captures in that build
+#if !defined(__APPLE__)
 const RENDERDOC_API_1_0_0* RenderDoc() {
   const auto* api = r.vk.rex->vulkan_instance()->renderdoc_api();
   return api ? api->api_1_0_0() : nullptr;
 }
+#endif
 
 void BeginFrame() {
   std::lock_guard lock(r.mutex);
@@ -895,6 +896,7 @@ void RenderPresent(Image* picture) {
 
   // RenderDoc's own captures stop at the window's presents, which don't line up with these frames
   ++r.presents;
+#if !defined(__APPLE__)
   if (r.rdoc_frame && RenderDoc()) {
     // RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE, which the SDK's older copy of the header doesn't have
     void* device = *reinterpret_cast<void**>(vk.rex->vulkan_instance()->instance());
@@ -904,6 +906,8 @@ void RenderPresent(Image* picture) {
     }
     if (r.presents + 1 == r.rdoc_frame) RenderDoc()->StartFrameCapture(device, nullptr);
   }
+#endif
+
 }
 
 }  // namespace bardown::native
