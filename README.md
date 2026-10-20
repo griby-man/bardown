@@ -19,7 +19,7 @@ bardown runs NHL 14 as a native program, with no CPU emulation and no GPU emulat
 
 ![A game in progress, drawn at 3840x2160](docs/images/play.jpg)
 
-[Settings](docs/SETTINGS.md) | [The native renderer](docs/RENDERER.md) | [Changelog](CHANGELOG.md)
+[Settings](docs/SETTINGS.md) | [The native renderer](docs/RENDERER.md)
 
 ## Where it is
 
@@ -170,6 +170,8 @@ from it on your machine, and the tuning values in the settings are read out of t
 
 ## How it's put together
 
+![How it works](docs/images/architecture.svg)
+
 bardown stands on two outside projects and adds its own work on top.
 
 - **[ReXGlue SDK](https://github.com/rexglue/rexglue-sdk)** (BSD 3-Clause), pinned as a submodule. Its
@@ -264,7 +266,8 @@ Both reuse `generated/` from the build above, so codegen runs once.
   instead of stopping at the first one
 - `scripts/appimage.sh`, `scripts/build-compat.sh`, `scripts/windows-zip.sh`, `cmake/windows-xwin.cmake`:
   the release builds
-- `tools/`: the code scanners and development tools
+- `tools/`: the code scanners and development tools; `tools/play.py` draws the whiteboard in this README,
+  with its fonts in `tools/fonts`
 
 ## Fixes to the SDK
 
@@ -306,8 +309,9 @@ Spice Adams, bardown's mascot, endorses this game.
 
 bardown's own code is released under the [GNU General Public License v3.0](LICENSE). The parts it builds on keep
 their own licences: the ReXGlue SDK (BSD 3-Clause), XenosRecomp (MIT) and DirectXShaderCompiler (University of
-Illinois/NCSA), with copies in `packaging/licenses` and in every release build. NHL 14 itself belongs to
-Electronic Arts and isn't covered by any of them.
+Illinois/NCSA), with copies in `packaging/licenses` and in every release build. The handwriting in the
+drawings is Permanent Marker (Apache 2.0) and Patrick Hand (SIL Open Font License), with their licences in
+`tools/fonts`. NHL 14 itself belongs to Electronic Arts and isn't covered by any of them.
 
 Contributions are welcome; [CONTRIBUTING.md](CONTRIBUTING.md) has how.
 
