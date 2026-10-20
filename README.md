@@ -23,6 +23,8 @@ bardown runs NHL 14 as a native program, with no CPU emulation and no GPU emulat
 
 ## Where it is
 
+![Where bardown's at](docs/images/roadmap.svg)
+
 The offline modes below have been tested from start to finish without crashing, in scripted test runs (the
 game driven by recorded button presses), and all of them have been played by hand on the current version, by me
 and a friend ([Codeburglar55](https://codeberg.org/Codeburglar55) on Codeberg,
@@ -265,8 +267,8 @@ Both reuse `generated/` from the build above, so codegen runs once.
   instead of stopping at the first one
 - `scripts/appimage.sh`, `scripts/build-compat.sh`, `scripts/windows-zip.sh`, `cmake/windows-xwin.cmake`:
   the release builds
-- `tools/`: the code scanners and development tools; `tools/play.py` draws the whiteboard in this README,
-  with its fonts in `tools/fonts`
+- `tools/`: the code scanners and development tools; `tools/play.py` draws the how-it-works whiteboard in
+  this README, with its fonts in `tools/fonts`
 
 ## Fixes to the SDK
 
