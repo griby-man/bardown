@@ -96,7 +96,7 @@ to `%LOCALAPPDATA%\bardown` instead (paste that into File Explorer's address bar
 
 ### Controls
 
-Any controller SDL recognises works: Xbox, PlayStation (DualShock 4, DualSense), Switch Pro and most
+Any controller SDL recognizes works: Xbox, PlayStation (DualShock 4, DualSense), Switch Pro and most
 others, wired or Bluetooth. Without one, the keyboard stands in for an Xbox pad:
 
 | Pad | Keys |
@@ -181,7 +181,7 @@ bardown stands on two outside projects and adds its own work on top.
   emulator, which bardown keeps only as a fallback.
 - **[XenosRecomp](https://github.com/hedge-dev/XenosRecomp)** (MIT), pinned as a submodule, translates
   Xbox shader microcode to HLSL; Microsoft's DirectXShaderCompiler (University of Illinois/NCSA) compiles
-  that to SPIR-V. Both ship in the AppImage with their licences.
+  that to SPIR-V. Both ship in the AppImage with their licenses.
 
 What bardown adds:
 
@@ -190,7 +190,7 @@ What bardown adds:
   `tools/`, each listed in `bardown_functions.toml` with how it was found.
 - **The native renderer** (`src/native/`): the game's Direct3D functions are replaced by address. Each
   draw is read from the device's own state and turned into a Vulkan draw; the match's worker-thread
-  recordings are put back in GPU order at the swap; textures, resolves and the team-colour composition
+  recordings are put back in GPU order at the swap; textures, resolves and the team-color composition
   are handled natively. The approach, drawing a recompiled game's Direct3D calls natively, is the one
   Unleashed Recompiled took for Sonic Unleashed; no code was taken from it. Details in
   [docs/RENDERER.md](docs/RENDERER.md).
@@ -288,7 +288,7 @@ Kept in `sdk/bardown-sdk.patch`:
 - **For the emulated GPU** (the fallback):
   - lighting: the Vulkan shader translator read a texture's exponent bias from the wrong word, and lit
     textures came out two to four times too bright;
-  - equipment colours: render targets the game reads back are resolved once when they're built, and a
+  - equipment colors: render targets the game reads back are resolved once when they're built, and a
     frame late when they repeat; a target redrawn every frame for half a second isn't copied back at
     all, since the game never reads those and copying them moved 1.8 GB a second;
   - a warning about invalid texture constants is reported once instead of for every draw, which had
@@ -306,12 +306,12 @@ Spice Adams, bardown's mascot, endorses this game.
 >
 > "Not now, chief. I'm in the zone."
 
-## Licence
+## License
 
 bardown's own code is released under the [GNU General Public License v3.0](LICENSE). The parts it builds on keep
-their own licences: the ReXGlue SDK (BSD 3-Clause), XenosRecomp (MIT) and DirectXShaderCompiler (University of
+their own licenses: the ReXGlue SDK (BSD 3-Clause), XenosRecomp (MIT) and DirectXShaderCompiler (University of
 Illinois/NCSA), with copies in `packaging/licenses` and in every release build. The handwriting in the
-drawings is Permanent Marker (Apache 2.0) and Patrick Hand (SIL Open Font License), with their licences in
+drawings is Permanent Marker (Apache 2.0) and Patrick Hand (SIL Open Font License), with their licenses in
 `tools/fonts`. NHL 14 itself belongs to Electronic Arts and isn't covered by any of them.
 
 Contributions are welcome; [CONTRIBUTING.md](CONTRIBUTING.md) has how.
