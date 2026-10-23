@@ -1,6 +1,6 @@
 #pragma once
 
-// reading the game's Direct3D device (docs/D3D.md). everything in guest memory is big-endian
+// reading the game's Direct3D device. everything in guest memory is big-endian
 
 #include <algorithm>
 #include <cstdint>

@@ -1,39 +1,33 @@
 # Settings
 
-**F1** opens them, over the game. Pick a section on the left; the search box finds a setting by name.
-Most changes take effect at once. A few, marked, need a restart: resolution is one.
+F1 opens them over the game. There's a search box. Most changes apply right away; the ones that need a
+restart say so.
 
-They're saved in `bardown.toml`, next to the program, but only the ones you've changed. Delete a line,
-or the whole file, to go back to the default.
+Only what you change gets saved, in `bardown.toml` next to the program. Delete a line (or the file) to
+go back to defaults.
 
 ## The picture
 
-- **Native resolution scale** (`native_resolution_scale`): 2 by default, so the game draws at 2560x1440
-  instead of the Xbox's 1280x720. 3 draws at 3840x2160; 1 is the Xbox's own. Takes effect on restart.
-- **Native renderer** (`native_renderer`): on by default. Off, bardown emulates the Xbox's GPU instead,
-  which is slower; its own resolution setting, `resolution_scale`, applies then (2 holds 60, 3 runs in the
-  high 40s). Takes effect on restart.
-- **Present effect**: how the drawn picture is stretched to your screen.
+- `native_resolution_scale`: 2 by default (2560x1440). 3 is 3840x2160, 1 is the Xbox's 720p. Restart.
+- `native_renderer`: on by default. Off uses the emulated GPU, which is a lot slower and uses its own
+  `resolution_scale` instead. Restart.
+- Present effect: how the picture gets stretched to your screen.
 
 ## Display
 
-- **Vsync** (`vsync_display`): on by default, so frames go to the screen in step with your display.
-  Off, they go out as fast as the GPU allows, which on a fast card is thousands a second for a game that
-  makes 60. Takes effect on restart.
-- **Frame limit** (`present_frame_limit`): the most frames a second sent to the screen: off (the
-  default, no limit beyond vsync), 30, 60, 120, 144 or 240. The game makes 60, so 60 matches it; 30
-  shows every other frame. Takes effect at once.
+- `vsync_display`: on by default. Off, it presents as fast as the GPU can, which is thousands a second
+  on a fast card for a game that only makes 60. Restart.
+- `present_frame_limit`: off (default), 30, 60, 120, 144 or 240. The game runs at 60.
 
 ## NHL 14
 
-Every tuning value the game has, read out of the running game once it's booted (a second or two after
-the title screen comes up), grouped the way EA grouped them: `AI/Defense`, `AI/Passing`,
-`Physics/Puck`, `Animation/Skating` and so on. Floats, whole numbers and switches each get one setting;
-the game's slider arrays, like the ones that change with difficulty, get one setting per entry
-(`nhl_gPassInterceptDifficultyCpu_0` is Rookie, `_3` Superstar).
+Every tuning value in the game (about 13,000), pulled from memory a second or two after the title
+screen, grouped the way EA grouped them (`AI/Defense`, `Physics/Puck`, `Animation/Skating`...). Arrays
+that change with difficulty get one entry each, so `nhl_gPassInterceptDifficultyCpu_0` is Rookie and
+`_3` is Superstar.
 
-These are EA's own names for EA's own values, and most of them were never meant to be touched. Change
-one, see what it does, change it back if it's not for you. Some worth a look:
+These are EA's internal values and most were never meant to be touched. Mess around, change it back if
+you don't like it. A few fun ones:
 
 | Setting | What it does |
 |---|---|
@@ -55,7 +49,7 @@ Any of them can be rebound under Keybinds.
 
 ## Starting it differently
 
-Every setting can also be given on the command line, `--name=value`, which beats the saved file:
+Any setting works on the command line as `--name=value`, and that wins over the file:
 
 ```sh
 ./bardown.AppImage --native_resolution_scale=3 --audio_mute=true
