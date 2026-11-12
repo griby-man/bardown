@@ -83,6 +83,19 @@ If something goes wrong, the newest file in the logs folder says what happened. 
 on a current driver; update the driver first if bardown says the GPU is missing something.
 EOF
 
+# every DLL a shipped file imports has to be in the folder or part of Windows. 0.3.4-0.3.7 went out with a
+# translator that needed fmt.dll: a reconfigure picked up xxHash's cached BUILD_SHARED_LIBS=ON
+system=" advapi32.dll bcrypt.dll dxgi.dll gdi32.dll hid.dll imm32.dll kernel32.dll ole32.dll oleaut32.dll setupapi.dll
+  shell32.dll user32.dll version.dll winmm.dll ws2_32.dll "
+missing=""
+for f in "$dir"/*.exe "$dir"/*.dll; do
+  for dll in $(objdump -p "$f" | awk '/DLL Name/ {print tolower($3)}'); do
+    [[ $dll == api-ms-win-* || $system == *[[:space:]]$dll[[:space:]]* ]] && continue
+    [[ -n $(find "$dir" -maxdepth 1 -iname "$dll") ]] || missing+=" $(basename "$f"):$dll"
+  done
+done
+[[ -z $missing ]] || { echo "imports not shipped or not in Windows:$missing"; exit 1; }
+
 mkdir -p "$root/dist"
 out="$root/dist/$name.zip"
 rm -f "$out"
