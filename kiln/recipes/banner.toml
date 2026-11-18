@@ -1,0 +1,3 @@
+script = "banner.lua"
+out = "docs/images/banner.svg"
+seed = 7

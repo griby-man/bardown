@@ -1,0 +1,28 @@
+name = "bardown"
+
+# a coach's board, the black kind teams use on the bench: paint markers on a dark board in an aluminium frame,
+# the rink printed on it faintly. white marker for writing, the rink's own red and blue, green for what's done
+[palette]
+deep = "#0d0f12"
+board = "#171a1e"
+frame = "#4a5058"
+ghost = "#2a2f36"
+ghost_blue = "#25344a"
+ghost_red = "#3d2629"
+chalk = "#ecebe4"
+dim = "#8f969e"
+blue = "#6aa8f0"
+red = "#ef5a52"
+green = "#79c97f"
+yellow = "#f3cd56"
+
+# the first font is the default for text
+[[font]]
+family = "Patrick Hand"
+file = "fonts/PatrickHand.ttf"
+fallback = ["Comic Neue", "cursive"]
+
+[[font]]
+family = "Permanent Marker"
+file = "fonts/PermanentMarker.ttf"
+fallback = ["cursive"]

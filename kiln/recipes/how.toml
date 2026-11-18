@@ -1,0 +1,3 @@
+script = "how.lua"
+out = "docs/images/architecture.svg"
+seed = 91

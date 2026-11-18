@@ -2,9 +2,11 @@
 
 NHL 14 for the Xbox 360, recompiled to run natively on Linux and Windows.
 
-[![Linux](https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black)](#linux)
-[![Windows](https://img.shields.io/badge/Windows-0078D4?style=for-the-badge)](#windows)
-[![Vulkan](https://img.shields.io/badge/Vulkan-AC162C?style=for-the-badge&logo=vulkan&logoColor=white)](docs/RENDERER.md)
+[![Linux](https://img.shields.io/badge/Linux-f3cd56?style=for-the-badge&logo=linux&logoColor=0d0f12)](#linux)
+[![Windows](https://img.shields.io/badge/Windows-6aa8f0?style=for-the-badge)](#windows)
+[![Vulkan](https://img.shields.io/badge/Vulkan-ef5a52?style=for-the-badge&logo=vulkan&logoColor=0d0f12)](docs/RENDERER.md)
+
+![bardown written on a coach's board, and a shot that goes in off the crossbar](docs/images/banner.svg)
 
 The game's PowerPC code is translated to C++ ahead of time and compiled for x86-64, so it's EA's game,
 just running without an emulator. The Xbox side (kernel, files, threads, audio, input) comes from the
@@ -153,7 +155,8 @@ then packed with `scripts/windows-zip.sh`.
 - `src/`: setup, settings, input; `src/native/` is the renderer
 - `sdk/`: my patches to the SDK and XenosRecomp
 - `scripts/`: dev launcher and release builds
-- `tools/`: scanners and dev tools (`tools/play.py` draws the whiteboard above)
+- `tools/`: scanners and dev tools
+- `kiln/`: the banner and the play, drawn as code by kiln, my asset tool (`kiln build`)
 
 ## Spice
 
@@ -169,6 +172,6 @@ Spice Adams endorses this game.
 
 GPL-3.0 for bardown's own code. The ReXGlue SDK (BSD 3-Clause), XenosRecomp (MIT) and
 DirectXShaderCompiler (NCSA) keep theirs, copies in `packaging/licenses`. The drawing fonts are Permanent
-Marker (Apache 2.0) and Patrick Hand (OFL), licenses in `tools/fonts`. NHL 14 belongs to EA.
+Marker (Apache 2.0) and Patrick Hand (OFL), licenses in `kiln/fonts`. NHL 14 belongs to EA.
 
 Not affiliated with EA, the NHL or Microsoft. See [CONTRIBUTING.md](CONTRIBUTING.md) if you want to help.
